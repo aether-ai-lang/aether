@@ -1,0 +1,6 @@
+﻿use ai.core
+use web.core
+
+task ServeAI:
+    model = load_model("model.ae.bin") -> auto_hardware
+    serve model on port(8080) -> route("/predict")

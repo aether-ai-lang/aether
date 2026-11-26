@@ -55,7 +55,7 @@ class Call:
 
 @dataclass
 class Stmt:
-    kind: str  # assign | emit | return | expr | train | export
+    kind: str  # assign | emit | return | expr | train | export | serve
     expr: object | None
     line: int
     column: int
@@ -64,6 +64,7 @@ class Stmt:
     data: str | None = None
     epochs: int | None = None
     path: str | None = None
+    port: int | None = None
     modifiers: list[Modifier] = field(default_factory=list)
 
 

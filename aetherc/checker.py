@@ -15,17 +15,19 @@ from .diagnostics import (
     replace_span_patch,
 )
 
-ALLOWED_MODULES = {"ai.core"}
-KNOWN_INTENTS = ("tensor", "load_data", "neural_net", "classifier", "run")
+ALLOWED_MODULES = {"ai.core", "web.core"}
+KNOWN_INTENTS = ("tensor", "load_data", "load_model", "neural_net", "classifier", "run")
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
 MAX_ELEMENTS = 100_000_000
 MAX_SAMPLES = 1_000_000
 MAX_CLASSES = 1_000
+MAX_PORT = 65535
 
 SIGNATURES = {
     "tensor": "tensor(rows, cols) -> auto_hardware",
     "load_data": "load_data(samples: N, features: D, classes: K?) -> auto_hardware",
+    "load_model": 'load_model("model.ae.bin") -> auto_hardware',
     "neural_net": "neural_net(in: X, out: Y, hidden: N?) -> optimize(speed: max|balanced|low)",
     "classifier": "classifier(in: D, classes: K, hidden: N?) -> optimize(speed: max|balanced|low)",
     "run": "run model(data) -> stream_output",
@@ -61,7 +63,9 @@ class Checker:
         self._seen: set[tuple] = set()
         self.uses: set[str] = {u.module for u in program.uses}
         self.core_avail = "ai.core" in self.uses
+        self.web_avail = "web.core" in self.uses
         self.reported_missing_core = False
+        self.reported_missing_web = False
 
     # ------------------------------------------------------------------ utils
     def error(
@@ -229,6 +233,10 @@ class Checker:
             self.check_export(stmt, scope)
             return
 
+        if stmt.kind == "serve":
+            self.check_serve(stmt, scope)
+            return
+
         if stmt.kind == "assign":
             ty = self.check_expr(stmt.expr, scope, default_policy)
             scope[stmt.name or ""] = ty
@@ -318,11 +326,31 @@ class Checker:
             patch=insert_line_patch(self.path, self.lines, insert_at, "use ai.core"),
         )
 
+    def require_web_core(self, stmt: Stmt) -> None:
+        if self.web_avail or self.reported_missing_web:
+            return
+        self.reported_missing_web = True
+
+        if self.program.uses:
+            insert_at = max(u.line for u in self.program.uses) + 1
+        elif self.program.tasks:
+            insert_at = self.program.tasks[0].line
+        else:
+            insert_at = 1
+        self.error(
+            "AE0200",
+            "Missing 'use web.core' for web intents",
+            stmt.line,
+            stmt.column,
+            hint="Add 'use web.core' above the first task to serve models over HTTP.",
+            patch=insert_line_patch(self.path, self.lines, insert_at, "use web.core"),
+        )
+
     def check_call(self, call: Call, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
         if call.name not in KNOWN_INTENTS:
             suggestion = self._suggest(call.name, KNOWN_INTENTS)
             patch = None
-            hint = f"v0.2 intents: {', '.join(KNOWN_INTENTS)}."
+            hint = f"v0.3 intents: {', '.join(KNOWN_INTENTS)}."
             if suggestion:
                 hint = f"Did you mean '{suggestion}'?"
                 patch = replace_span_patch(
@@ -344,6 +372,8 @@ class Checker:
             return self.check_tensor(call)
         if call.name == "load_data":
             return self.check_load_data(call)
+        if call.name == "load_model":
+            return self.check_load_model(call)
         if call.name == "neural_net":
             return self.check_neural_net(call, scope, default_policy)
         if call.name == "classifier":
@@ -540,6 +570,98 @@ class Checker:
             samples=samples,
             features=features,
             classes=classes,
+        )
+
+    # -------------------------------------------------------- intent: load_model
+    def check_load_model(self, call: Call) -> Ty:
+        bound, _ = self.bind(call, [("path", True)])
+        node = bound.get("path")
+
+        path: str | None = None
+        if isinstance(node, Literal) and isinstance(node.value, str):
+            path = node.value
+        elif node is not None:
+            self.error(
+                "AE0212",
+                "load_model requires a quoted path",
+                getattr(node, "line", call.line),
+                getattr(node, "column", call.column),
+                hint='Example: load_model("model.ae.bin")',
+            )
+
+        if "auto_hardware" not in [m.name for m in call.modifiers]:
+            self.error(
+                "AE0300",
+                "load_model(...) requires '-> auto_hardware'",
+                call.line,
+                call.column,
+                hint="Append '-> auto_hardware' so the compiler can bind a device.",
+                patch=self._append_modifier(call.line, "-> auto_hardware"),
+            )
+
+        seen: set[str] = set()
+        for mod in call.modifiers:
+            if mod.name != "auto_hardware":
+                suggestion = self._suggest(mod.name, ("auto_hardware",))
+                patch = None
+                if suggestion:
+                    patch = replace_span_patch(
+                        self.path, self.lines, mod.line, mod.column, len(mod.name), suggestion
+                    )
+                self.error(
+                    "AE0302",
+                    f"Unknown modifier '-> {mod.name}'",
+                    mod.line,
+                    mod.column,
+                    hint="Only '-> auto_hardware' is valid for load_model().",
+                    patch=patch,
+                )
+                continue
+            if mod.name in seen:
+                self.error(
+                    "AE0302",
+                    "Duplicate '-> auto_hardware' modifier",
+                    mod.line,
+                    mod.column,
+                    hint="Remove the repeated modifier.",
+                )
+            seen.add(mod.name)
+            if mod.args:
+                self.error(
+                    "AE0212",
+                    "auto_hardware takes no arguments",
+                    mod.args[0].line,
+                    mod.args[0].column,
+                    hint="Write '-> auto_hardware' without parentheses.",
+                )
+
+        if path is None:
+            return ERROR
+        if not path:
+            self.error(
+                "AE0212",
+                "load_model path must not be empty",
+                call.line,
+                call.column,
+                hint='Example: load_model("model.ae.bin")',
+            )
+            return ERROR
+        if len(path) > 240:
+            self.error(
+                "AE0212",
+                "load_model path is too long",
+                call.line,
+                call.column,
+                hint="Keep the path under 240 characters.",
+            )
+            return ERROR
+
+        return Ty(
+            "model",
+            model_kind="served",
+            trained=True,
+            decl_line=call.line,
+            decl_column=call.column,
         )
 
     # --------------------------------------------------------- intent: classifier
@@ -781,6 +903,107 @@ class Checker:
             else:
                 model_ty.trained = True
 
+    # --------------------------------------------------------- statement: serve
+    def check_serve(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
+        self.require_web_core(stmt)
+
+        if stmt.target is None or stmt.target not in scope:
+            self.error(
+                "AE0211",
+                f"Undefined model '{stmt.target}'",
+                stmt.line,
+                stmt.column,
+                hint='Load or train one first: model = load_model("model.ae.bin") -> auto_hardware',
+            )
+        else:
+            ty = scope[stmt.target]
+            if ty.kind != "model":
+                self.error(
+                    "AE0210",
+                    f"'serve' expects a model, but '{stmt.target}' is {self.article(ty.kind)}",
+                    stmt.line,
+                    stmt.column,
+                    hint="Serve the result of load_model(...), classifier(...), or neural_net(...).",
+                )
+
+        port = stmt.port or 0
+        if not 1 <= port <= MAX_PORT:
+            self.error(
+                "AE0212",
+                f"port must be between 1 and {MAX_PORT}",
+                stmt.line,
+                stmt.column,
+                hint="Example: serve model on port(8080) -> route(\"/predict\")",
+            )
+
+        routes = [m for m in stmt.modifiers if m.name == "route"]
+        for mod in stmt.modifiers:
+            if mod.name != "route":
+                suggestion = self._suggest(mod.name, ("route",))
+                patch = None
+                if suggestion:
+                    patch = replace_span_patch(
+                        self.path, self.lines, mod.line, mod.column, len(mod.name), suggestion
+                    )
+                self.error(
+                    "AE0302",
+                    f"Unknown modifier '-> {mod.name}'",
+                    mod.line,
+                    mod.column,
+                    hint='serve accepts only \'-> route("/predict")\'.',
+                    patch=patch,
+                )
+                continue
+
+        if len(routes) > 1:
+            self.error(
+                "AE0302",
+                "Duplicate '-> route(...)' modifier",
+                routes[1].line,
+                routes[1].column,
+                hint="Keep a single route.",
+            )
+
+        if not routes:
+            self.error(
+                "AE0300",
+                "serve requires '-> route(\"/...\")'",
+                stmt.line,
+                stmt.column,
+                hint='Add the HTTP endpoint, e.g. -> route("/predict").',
+                patch=self._append_modifier(stmt.line, '-> route("/predict")'),
+            )
+        else:
+            route_mod = routes[0]
+            if len(route_mod.args) != 1 or not isinstance(
+                route_mod.args[0].value, Literal
+            ) or not isinstance(route_mod.args[0].value.value, str):
+                self.error(
+                    "AE0212",
+                    "route requires one quoted path",
+                    route_mod.line,
+                    route_mod.column,
+                    hint='Example: -> route("/predict")',
+                )
+            else:
+                route = route_mod.args[0].value.value
+                if not route.startswith("/"):
+                    self.error(
+                        "AE0212",
+                        "route must start with '/'",
+                        route_mod.args[0].line,
+                        route_mod.args[0].column,
+                        hint='Example: -> route("/predict")',
+                    )
+                elif len(route) > 128:
+                    self.error(
+                        "AE0212",
+                        "route is too long",
+                        route_mod.args[0].line,
+                        route_mod.args[0].column,
+                        hint="Keep the route under 128 characters.",
+                    )
+
     # -------------------------------------------------------- statement: export
     def check_export(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
         if stmt.target is None or stmt.target not in scope:
@@ -985,6 +1208,15 @@ class Checker:
                     call.line,
                     call.column,
                     hint="Only the result of neural_net(...) or classifier(...) can be run.",
+                )
+                model_ty = None
+            elif model_ty.model_kind == "served":
+                self.error(
+                    "AE0210",
+                    f"'{call.target}' was loaded for serving and has no compile-time shape",
+                    call.line,
+                    call.column,
+                    hint='Expose it over HTTP instead: serve model on port(8080) -> route("/predict").',
                 )
                 model_ty = None
 

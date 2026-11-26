@@ -1,10 +1,12 @@
-# Aether (.ae) — Language Specification v0.2
+# Aether (.ae) — Language Specification v0.3
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
-training run, a stream); the compiler decides *how* (device, dtype, fusion,
-buffering, threading, even the BLAS thread pool). v0.2 compiles the same intent
-graph to **standalone, multi-threaded C** (`--target=c`, the default when a C
-compiler is present — zero Python at runtime) or to optimized NumPy/OpenBLAS Python.
+training run, a stream, an HTTP endpoint); the compiler decides *how* (device, dtype,
+fusion, buffering, threading, even the BLAS thread pool). v0.3 compiles the same
+intent graph to **standalone, multi-threaded C** (`--target=c`, the default when a C
+compiler is present — zero Python at runtime) or to optimized NumPy/OpenBLAS Python,
+and can serve trained models over HTTP as a **native C99 JSON API**. The `aether mcp`
+command exposes the whole toolchain to AI agents over the Model Context Protocol.
 
 ## 1. Lexical rules
 
@@ -23,6 +25,7 @@ task_decl   := "task" IDENT [ "->" modifier ] ":" NEWLINE INDENT { stmt } DEDENT
 stmt        := IDENT "=" expr NEWLINE
              | "train" IDENT "on" IDENT "(" "epochs" ":" NUMBER ")" { "->" modifier } NEWLINE
              | "export" IDENT "->" STRING NEWLINE
+             | "serve" IDENT "on" "port" "(" NUMBER ")" { "->" modifier } NEWLINE
              | "emit" expr NEWLINE
              | "return" expr NEWLINE
              | expr NEWLINE
@@ -36,14 +39,17 @@ modifier    := IDENT [ "(" [ args ] ")" ]
 ```
 
 `run` is a special form: it takes a **model variable**, then the input tensor or
-dataset. Modifiers chain with `->`; at most one of each kind is meaningful.
+dataset. `serve` is a blocking statement: the program becomes an HTTP server until
+interrupted. Modifiers chain with `->`; at most one of each kind is meaningful.
 
 ## 3. Declarations
 
 ```
 use ai.core
+use web.core
 ```
-The only module in v0.2. It is required before any intent call. `use` lines must
+`ai.core` is required before any AI intent. `web.core` is required before `serve`
+(omitting it is `AE0200` with a fix patch that inserts the line). `use` lines must
 come before tasks.
 
 ```
@@ -59,10 +65,12 @@ entrypoint**. A task body must contain at least one statement. No parameters in 
 |---|---|---|---|
 | allocate input | `tensor(rows, cols)` | `tensor[rows, cols]` | `-> auto_hardware` |
 | load dataset | `load_data(samples: N, features: D, classes: K?)` | `dataset` | `-> auto_hardware` |
+| load model | `load_model("model.ae.bin")` | `model` (served) | `-> auto_hardware` |
 | build network | `neural_net(in: X, out: Y, hidden: N?)` | `model` | none (see `optimize`) |
 | build classifier | `classifier(in: D, classes: K, hidden: N?)` | `model` | none (see `optimize`) |
 | training | `train model on dataset(epochs: E)` | — | `-> self_heal` |
 | inference | `run model(data)` | `stream` | `-> stream_output` |
+| serving | `serve model on port(P)` | — (blocks) | `-> route("/...")`, needs `web.core` |
 | persistence | `export model -> "model.ae.bin"` | — | — |
 
 ### `tensor(rows, cols) -> auto_hardware`
@@ -94,6 +102,30 @@ gradient-norm clip 5.0). `self_heal` is mandatory (`AE0300`): after every step a
 epoch the runtime validates loss/gradients, rolls back to the best checkpoint and
 halves the learning rate on divergence, emitting `heal` events. `epochs` is an
 integer literal 1..1000. Feature and class mismatches are compile errors (`AE0210`).
+
+### `load_model("model.ae.bin") -> auto_hardware`
+Loads a previously exported **AEB1** model file (see `export`). The path is a string
+literal; relative paths resolve against the source file's directory. `auto_hardware`
+is required (`AE0300`). The returned model has no compile-time shape — the loader
+validates the header and dimensions at runtime — so it cannot be used with `run`
+(`AE0210`); its purpose is `serve`.
+
+### `serve model on port(P) -> route("/predict")`
+Turns the program into a **blocking HTTP/JSON inference server**. Requires
+`use web.core` (`AE0200`) and a `route` modifier (`AE0300`). `P` is an integer
+literal 1..65535; the route must be a quoted string starting with `/`.
+The `AETHER_PORT` environment variable overrides the port at launch.
+
+The native C backend implements the server directly on Winsock2 (Windows) or POSIX
+sockets, with one thread per connection; the Python backend uses the standard
+library's threaded HTTP server. Behavior is identical:
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /health` (or `/`) | `{"status":"ok","model":"served","in_dim":D,"out_dim":K,"route":...}` |
+| `POST <route>` | body `{"features":[...]}` (or a bare JSON array); returns `{"prediction":i,"confidence":p,"probabilities":[...],"in_dim":D,"out_dim":K,"elapsed_ms":ms}` |
+| anything else | `404 {"error":"not found"}` |
+| wrong feature count / invalid JSON | `400 {"error":"features must be an array of D numbers"}` |
 
 ### `run model(data) -> stream_output`
 Chunked inference. For `neural_net` models `data` is a tensor whose width matches
@@ -145,6 +177,18 @@ task TrainAgent:
     run model(dataset) -> stream_output
 ```
 
+Serving a trained model as a native HTTP API (4 lines; run `aether run` and the
+binary *is* the server):
+
+```aether
+use ai.core
+use web.core
+
+task ServeAI:
+    model = load_model("model.ae.bin") -> auto_hardware
+    serve model on port(8080) -> route("/predict")
+```
+
 ## 7. Backends and the CLI
 
 ```
@@ -152,6 +196,7 @@ aether run <file.ae>   [--target auto|c|python] [--cc PATH] [--task NAME]
                        [--chunks N] [--json] [--emit-only] [--build-dir DIR]
 aether check <file.ae> [--compact]
 aether bench <file.ae> [--task NAME] [--repeat N] [--threads N] [--json]
+aether mcp
 aether version
 ```
 
@@ -159,9 +204,9 @@ aether version
   whenever a C compiler (gcc/clang/MSVC) is found; otherwise falls back to the
   Python/NumPy backend with a visible notice. The native binary is written to
   `.aether_build/<name>.c` and compiled to `.aether_build/<name>.exe` with
-  `-O3 -march=native -fopenmp`, linking OpenBLAS when available. At runtime the C
-  backend adapts the BLAS thread pool per GEMM shape and streams live output —
-  **no Python involved in execution**.
+  `-O3 -march=native -fopenmp` (plus `-lws2_32` on Windows), linking OpenBLAS when
+  available. At runtime the C backend adapts the BLAS thread pool per GEMM shape
+  and streams live output — **no Python involved in execution**.
 - `--target=python` forces the NumPy/OpenBLAS backend (`.aether_build/<name>.py`).
 - `--emit-only` writes the generated artifact without running it.
 - `check` always prints JSON diagnostics; exits `0` (ok) / `1` (errors) / `2` (file).
@@ -169,6 +214,20 @@ aether version
   Aether Python, a hand-written NumPy script, and a hand-written PyTorch script —
   and reports tokens, lines of code, train/infer/total time (median of `--repeat`),
   and accuracy.
+- **`mcp`** runs the Model Context Protocol server (JSON-RPC 2.0 over stdio,
+  newline-delimited) so AI coding agents can drive the toolchain directly:
+
+  | Tool | Purpose |
+  |---|---|
+  | `aether_check` | validate an `.ae` file; returns the full diagnostics JSON |
+  | `aether_fix` | return the combined `fix_patch` and (by default) apply it, then re-validate |
+  | `aether_compile` | emit and compile the native C binary or Python artifact |
+  | `aether_run` | execute a task, returning the machine-readable run payload |
+  | `aether_spec` | read `AETHER_SPEC.md` (whole or one `##` section) |
+  | `aether_bench` | run the cross-implementation benchmark |
+
+  MCP config for agents: command `python aether.py`, args `["mcp"]`
+  (OpenCode/Claude Code/Cursor all speak this protocol).
 - Exit codes: `0` success, `1` compile error, `2` usage/file error, `3` runtime error.
 
 ## 8. Machine-readable errors (self-healing contract)
@@ -213,6 +272,9 @@ toolchain missing, `AE0000` unreadable/missing file, `AE9999` internal compiler 
    `train model on dataset(epochs: N) -> self_heal`,
    `export model -> "model.ae.bin"`,
    `run model(data) -> stream_output`.
-3. Dimensions and epochs are integer literals; export paths are string literals.
-4. Define every variable before use; `train` before `export`; tasks are straight-line.
-5. Run `aether check file.ae`; if `status == "error"`, apply `fix_patch` and re-check.
+3. Dimensions, epochs, and ports are integer literals; export paths and routes are
+   string literals; routes must start with `/`.
+4. Define every variable before use; `train` before `export`; `serve` is last — it
+   blocks. Tasks are straight-line.
+5. Run `aether check file.ae`; if `status == "error"`, apply `fix_patch` and re-check
+   (or call the `aether_fix` MCP tool, which does both in one step).

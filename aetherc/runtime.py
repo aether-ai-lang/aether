@@ -828,6 +828,123 @@ class Runtime:
         )
         return model
 
+    # ------------------------------------------------------------- web serving
+    def load_model(self, path: str) -> Model:
+        """Load an AEB1 model file (alias of Runtime.load)."""
+        return self.load(path)
+
+    def serve(self, model: Model, port: int, route: str) -> None:
+        """Block serving `model` over HTTP/JSON at http://127.0.0.1:<port><route>."""
+        import json as _json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        if not isinstance(model, Model):
+            raise TypeError("serve target must be a model")
+        port = int(os.environ.get("AETHER_PORT") or port)
+        route = os.environ.get("AETHER_ROUTE") or route
+        runtime = self
+        started = time.perf_counter()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _reply(self, status: int, payload: dict) -> None:
+                body = _json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802 - http.server API
+                if self.path.split("?")[0] in ("/health", "/"):
+                    self._reply(
+                        200,
+                        {
+                            "status": "ok",
+                            "model": "served",
+                            "in_dim": model.in_dim,
+                            "out_dim": model.out_dim,
+                            "route": route,
+                        },
+                    )
+                else:
+                    self._reply(404, {"error": "not found", "route": route})
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                request_started = time.perf_counter()
+                if self.path.split("?")[0] != route:
+                    self._reply(404, {"error": "not found", "route": route})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    payload = _json.loads(self.rfile.read(length) or b"null")
+                except ValueError:
+                    self._reply(400, {"error": "invalid JSON body"})
+                    return
+                features = (
+                    payload.get("features")
+                    if isinstance(payload, dict)
+                    else payload
+                )
+                if not isinstance(features, list) or len(features) != model.in_dim:
+                    self._reply(
+                        400,
+                        {
+                            "error": f"features must be an array of {model.in_dim} numbers",
+                            "received": len(features) if isinstance(features, list) else None,
+                        },
+                    )
+                    return
+                try:
+                    x = np.asarray(features, dtype=F32).reshape(1, model.in_dim)
+                except (TypeError, ValueError):
+                    self._reply(400, {"error": "features must be numbers"})
+                    return
+                probabilities = runtime._softmax(runtime._forward(model, x))[0]
+                prediction = int(probabilities.argmax())
+                elapsed_ms = (time.perf_counter() - request_started) * 1000.0
+                self._reply(
+                    200,
+                    {
+                        "prediction": prediction,
+                        "confidence": float(probabilities[prediction]),
+                        "probabilities": [float(v) for v in probabilities],
+                        "in_dim": model.in_dim,
+                        "out_dim": model.out_dim,
+                        "elapsed_ms": elapsed_ms,
+                    },
+                )
+                runtime._emit_event(
+                    "request",
+                    method="POST",
+                    path=self.path.split("?")[0],
+                    prediction=prediction,
+                    confidence=float(probabilities[prediction]),
+                    ms=elapsed_ms,
+                    total_ms=(time.perf_counter() - started) * 1000.0,
+                )
+
+            def log_message(self, fmt: str, *args: object) -> None:  # silence stderr
+                return
+
+        server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self._emit_event(
+            "serve_start",
+            port=port,
+            route=route,
+            in_dim=model.in_dim,
+            out_dim=model.out_dim,
+            backend="python",
+        )
+        try:
+            server.serve_forever(poll_interval=0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+            self._emit_event("serve_stop", port=port, backend="python")
+
     # ------------------------------------------------------------------ emit
     def emit(self, value: object) -> None:
         if isinstance(value, Tensor):

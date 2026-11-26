@@ -80,6 +80,10 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
             f"{extra})"
         )
 
+    if call.name == "load_model":
+        bound = _bind(call, ["path"])
+        return f"rt.load_model({_value_src(bound.get('path'))})"
+
     if call.name == "classifier":
         bound = _bind(call, ["in", "classes", "hidden"])
         hidden = _value_src(bound["hidden"]) if "hidden" in bound else "128"
@@ -134,6 +138,15 @@ def _stmt_src(stmt: Stmt, task_policy: dict | None, source_lines: list[str]) -> 
         rendered.append(f"rt.train({stmt.target}, {stmt.data}, epochs={stmt.epochs})")
     elif stmt.kind == "export":
         rendered.append(f"rt.export({stmt.target}, {stmt.path!r})")
+    elif stmt.kind == "serve":
+        route = "/predict"
+        for mod in stmt.modifiers:
+            if mod.name == "route" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, str):
+                    route = value.value
+                    break
+        rendered.append(f"rt.serve({stmt.target}, port={stmt.port}, route={route!r})")
     else:
         rendered.append(_expr_src(stmt.expr, task_policy))
 

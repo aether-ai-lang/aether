@@ -157,7 +157,31 @@ PREAMBLE = r'''/*
 extern void openblas_set_num_threads(int num_threads);
 #endif
 
-#define AE_VERSION "0.2"
+/* ------------------------------------------------------------------ sockets */
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <process.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+typedef SOCKET ae_socket_t;
+#define AE_INVALID_SOCKET INVALID_SOCKET
+#define AE_CLOSE_SOCKET(s) closesocket(s)
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
+typedef int ae_socket_t;
+#define AE_INVALID_SOCKET (-1)
+#define AE_CLOSE_SOCKET(s) close(s)
+#endif
+
+#define AE_VERSION "0.3"
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -290,6 +314,17 @@ typedef struct {
     float *w1, *b1, *w2, *b2;
 } Model;
 typedef struct { int rows, out_dim, chunks; double checksum; unsigned digest; double accuracy; } StreamResult;
+
+static char ae_base_dir[1024] = "";
+
+static void ae_resolve_path(const char *path, char *out, size_t cap) {
+    int absolute = path[0] == '/' || path[0] == '\\' || (path[0] && path[1] == ':');
+    if (!absolute && ae_base_dir[0]) {
+        snprintf(out, cap, "%s/%s", ae_base_dir, path);
+    } else {
+        snprintf(out, cap, "%s", path);
+    }
+}
 
 static void ae_gemm(const float *a, const float *b, float *c, int m, int k, int n) {
     ae_blas_tune(m, k, n);
@@ -670,8 +705,6 @@ static double ae_train(Model *m, Dataset *d, int epochs, int batch, float learni
     return elapsed;
 }
 
-static char ae_base_dir[1024] = "";
-
 static void ae_json_escape(const char *src, char *dst, size_t cap) {
     size_t o = 0;
     for (const char *p = src; *p && o + 2 < cap; p++) {
@@ -889,6 +922,376 @@ static void ae_emit_stream(StreamResult value) {
              value.rows, value.out_dim, value.checksum, value.digest, value.accuracy);
     ae_human("  [emit]   stream[%dx%d] checksum=%+.2f digest=0x%08x", value.rows, value.out_dim, value.checksum, value.digest);
 }
+
+/* ------------------------------------------------------------- AEB1 loading */
+static Model ae_model_load(const char *path) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "rb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot open model %s\n", resolved);
+        exit(3);
+    }
+    uint32_t header[8];
+    if (fread(header, sizeof(uint32_t), 8, handle) != 8 ||
+        header[0] != 0x31424541u || header[1] != 1u) {
+        fprintf(stderr, "aether: %s is not an AEB1 v1 model file\n", resolved);
+        exit(3);
+    }
+
+    Model m;
+    memset(&m, 0, sizeof(m));
+    m.kind = (int)header[2];
+    m.in_dim = (int)header[3];
+    m.hidden = (int)header[4];
+    m.out_dim = (int)header[5];
+    m.classes = m.kind ? (int)header[6] : 0;
+    m.trained = 1;
+    size_t nw1 = (size_t)m.in_dim * m.hidden, nb1 = (size_t)m.hidden;
+    size_t nw2 = (size_t)m.hidden * m.out_dim, nb2 = (size_t)m.out_dim;
+    m.w1 = ae_falloc(nw1);
+    m.b1 = ae_falloc(nb1);
+    m.w2 = ae_falloc(nw2);
+    m.b2 = ae_falloc(nb2);
+    if (fread(m.w1, sizeof(float), nw1, handle) != nw1 ||
+        fread(m.b1, sizeof(float), nb1, handle) != nb1 ||
+        fread(m.w2, sizeof(float), nw2, handle) != nw2 ||
+        fread(m.b2, sizeof(float), nb2, handle) != nb2) {
+        fprintf(stderr, "aether: %s is truncated\n", resolved);
+        exit(3);
+    }
+    fclose(handle);
+
+    char escaped[2400];
+    ae_json_escape(resolved, escaped, sizeof(escaped));
+    int params = m.in_dim * m.hidden + m.hidden + m.hidden * m.out_dim + m.out_dim;
+    ae_event("{\"event\":\"load\",\"path\":\"%s\",\"in_dim\":%d,\"hidden\":%d,\"out_dim\":%d,\"params\":%d,\"kind\":\"%s\",\"backend\":\"c\"}",
+             escaped, m.in_dim, m.hidden, m.out_dim, params, m.kind ? "classifier" : "mlp");
+    ae_human("  [model]  loaded %s | %d -> %d -> %d | %d params | AEB1",
+             resolved, m.in_dim, m.hidden, m.out_dim, params);
+    return m;
+}
+
+/* ------------------------------------------------------ native HTTP server */
+static volatile int ae_shutdown = 0;
+
+#ifdef _WIN32
+static BOOL WINAPI ae_ctrl_handler(DWORD type) {
+    (void)type;
+    ae_shutdown = 1;
+    return TRUE;
+}
+#else
+static void ae_on_sigint(int sig) {
+    (void)sig;
+    ae_shutdown = 1;
+}
+#endif
+
+static int ae_recv(ae_socket_t fd, char *buf, int cap) {
+#ifdef _WIN32
+    return recv(fd, buf, cap, 0);
+#else
+    return (int)read(fd, buf, (size_t)cap);
+#endif
+}
+
+static void ae_send_all(ae_socket_t fd, const char *buf, size_t len) {
+#ifdef _WIN32
+    int offset = 0;
+    while (offset < (int)len) {
+        int n = send(fd, buf + offset, (int)(len - (size_t)offset), 0);
+        if (n <= 0) return;
+        offset += n;
+    }
+#else
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t n = write(fd, buf + offset, len - offset);
+        if (n <= 0) return;
+        offset += (size_t)n;
+    }
+#endif
+}
+
+static void ae_http_respond(ae_socket_t fd, int status, const char *json) {
+    const char *reason = status == 200 ? "OK"
+                       : status == 400 ? "Bad Request"
+                       : status == 404 ? "Not Found" : "Error";
+    char header[256];
+    int n = snprintf(header, sizeof(header),
+                     "HTTP/1.1 %d %s\r\n"
+                     "Content-Type: application/json\r\n"
+                     "Content-Length: %d\r\n"
+                     "Connection: close\r\n\r\n",
+                     status, reason, (int)strlen(json));
+    ae_send_all(fd, header, (size_t)n);
+    ae_send_all(fd, json, strlen(json));
+}
+
+/* Extracts a float array from {"features": [...]} or a bare [...] body. */
+static int ae_json_extract_features(const char *body, float *out, int max) {
+    const char *cursor = strstr(body, "\"features\"");
+    if (cursor) {
+        cursor = strchr(cursor, '[');
+    } else {
+        cursor = strchr(body, '[');
+    }
+    if (!cursor) return -1;
+    cursor++;
+    int count = 0;
+    while (*cursor && *cursor != ']') {
+        char *end = NULL;
+        float value = strtof(cursor, &end);
+        if (end == cursor) {
+            cursor++;
+            continue;
+        }
+        if (count < max) out[count] = value;
+        count++;
+        cursor = end;
+    }
+    return count;
+}
+
+static int strncasecmpaliases(const char *a, const char *b, size_t n) {
+#ifdef _WIN32
+    return _strnicmp(a, b, n);
+#else
+    return strncasecmp(a, b, n);
+#endif
+}
+
+static int ae_header_int(const char *headers, const char *name) {
+    size_t name_len = strlen(name);
+    const char *line = headers;
+    while (line && *line) {
+        const char *eol = strstr(line, "\r\n");
+        size_t span = eol ? (size_t)(eol - line) : strlen(line);
+        if (span > name_len && line[name_len] == ':' &&
+            strncasecmpaliases(line, name, name_len) == 0) {
+            return atoi(line + name_len + 1);
+        }
+        line = eol ? eol + 2 : NULL;
+    }
+    return 0;
+}
+
+typedef struct {
+    ae_socket_t fd;
+    Model *model;
+    char route[128];
+} AeConn;
+
+static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route);
+
+#ifdef _WIN32
+static unsigned __stdcall ae_conn_trampoline(void *arg) {
+    AeConn *conn = (AeConn *)arg;
+    ae_handle_connection(conn->fd, conn->model, conn->route);
+    free(conn);
+    return 0;
+}
+#else
+static void *ae_conn_trampoline(void *arg) {
+    AeConn *conn = (AeConn *)arg;
+    ae_handle_connection(conn->fd, conn->model, conn->route);
+    free(conn);
+    return NULL;
+}
+#endif
+
+static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route) {
+    const size_t cap = 262144;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        AE_CLOSE_SOCKET(fd);
+        return;
+    }
+    size_t got = 0;
+    for (;;) {
+        if (got + 1 >= cap) break;
+        int n = ae_recv(fd, buf + got, (int)(cap - 1 - got));
+        if (n <= 0) break;
+        got += (size_t)n;
+        buf[got] = 0;
+        char *sep = strstr(buf, "\r\n\r\n");
+        if (sep) {
+            int content_length = ae_header_int(buf, "Content-Length");
+            size_t head = (size_t)(sep + 4 - buf);
+            if (content_length <= 0 || got >= head + (size_t)content_length) break;
+        }
+    }
+    if (!got) {
+        free(buf);
+        AE_CLOSE_SOCKET(fd);
+        return;
+    }
+    buf[got] = 0;
+
+    char method[16] = {0}, path[1024] = {0};
+    sscanf(buf, "%15s %1023s", method, path);
+    char *query = strchr(path, '?');
+    if (query) *query = 0;
+    double request_started = ae_now_ms();
+
+    if (strcmp(method, "GET") == 0 &&
+        (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0)) {
+        char body[320];
+        snprintf(body, sizeof(body),
+                 "{\"status\":\"ok\",\"model\":\"served\",\"in_dim\":%d,\"out_dim\":%d,\"route\":\"%s\"}",
+                 model->in_dim, model->out_dim, route);
+        ae_http_respond(fd, 200, body);
+        ae_event("{\"event\":\"request\",\"method\":\"GET\",\"path\":\"%s\",\"status\":200,\"ms\":%.6f,\"backend\":\"c\"}",
+                 path, ae_now_ms() - request_started);
+    } else if (strcmp(method, "POST") == 0 && strcmp(path, route) == 0) {
+        char *body = strstr(buf, "\r\n\r\n");
+        float *features = ae_falloc((size_t)model->in_dim);
+        int count = body ? ae_json_extract_features(body + 4, features, model->in_dim) : -1;
+        if (count != model->in_dim) {
+            char body_out[160];
+            snprintf(body_out, sizeof(body_out),
+                     "{\"error\":\"features must be an array of %d numbers\",\"received\":%d}",
+                     model->in_dim, count);
+            ae_http_respond(fd, 400, body_out);
+            ae_event("{\"event\":\"request\",\"method\":\"POST\",\"path\":\"%s\",\"status\":400,\"ms\":%.6f,\"backend\":\"c\"}",
+                     path, ae_now_ms() - request_started);
+        } else {
+            float *hidden = ae_falloc((size_t)model->hidden);
+            float *logits = ae_falloc((size_t)model->out_dim);
+            ae_forward(model, features, 1, hidden, logits);
+            ae_softmax(logits, 1, model->out_dim);
+            int best = 0;
+            for (int j = 1; j < model->out_dim; j++) {
+                if (logits[j] > logits[best]) best = j;
+            }
+            size_t out_cap = (size_t)model->out_dim * 20 + 512;
+            char *response = (char *)malloc(out_cap);
+            if (response) {
+                size_t offset = (size_t)snprintf(response, out_cap,
+                    "{\"prediction\":%d,\"confidence\":%.6f,\"probabilities\":[",
+                    best, (double)logits[best]);
+                for (int j = 0; j < model->out_dim; j++) {
+                    offset += (size_t)snprintf(response + offset, out_cap - offset,
+                                               "%s%.6f", j ? "," : "", (double)logits[j]);
+                }
+                snprintf(response + offset, out_cap - offset,
+                         "],\"in_dim\":%d,\"out_dim\":%d,\"elapsed_ms\":%.6f}",
+                         model->in_dim, model->out_dim, ae_now_ms() - request_started);
+                ae_http_respond(fd, 200, response);
+                ae_event("{\"event\":\"request\",\"method\":\"POST\",\"path\":\"%s\",\"status\":200,\"prediction\":%d,\"confidence\":%.6f,\"ms\":%.6f,\"backend\":\"c\"}",
+                         path, best, (double)logits[best], ae_now_ms() - request_started);
+                ae_human("  [request] POST %s | %d features | pred %d (%.3f) | %.2f ms",
+                         path, model->in_dim, best, (double)logits[best], ae_now_ms() - request_started);
+                free(response);
+            }
+            free(hidden);
+            free(logits);
+        }
+        free(features);
+    } else {
+        ae_http_respond(fd, 404, "{\"error\":\"not found\"}");
+        ae_event("{\"event\":\"request\",\"method\":\"%s\",\"path\":\"%s\",\"status\":404,\"ms\":%.6f,\"backend\":\"c\"}",
+                 method, path, ae_now_ms() - request_started);
+    }
+
+    free(buf);
+    AE_CLOSE_SOCKET(fd);
+}
+
+static void ae_http_serve(Model *model, int port, const char *route) {
+    const char *port_env = getenv("AETHER_PORT");
+    if (port_env && atoi(port_env) > 0) port = atoi(port_env);
+    int serve_seconds = 0;
+    const char *seconds = getenv("AETHER_SERVE_SECONDS");
+    if (seconds && atoi(seconds) > 0) serve_seconds = atoi(seconds);
+
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        fprintf(stderr, "aether: WSAStartup failed\n");
+        exit(3);
+    }
+    SetConsoleCtrlHandler(ae_ctrl_handler, TRUE);
+#else
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGINT, ae_on_sigint);
+#endif
+
+    ae_socket_t listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener == AE_INVALID_SOCKET) {
+        fprintf(stderr, "aether: socket() failed\n");
+        exit(3);
+    }
+    int one = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_port = htons((unsigned short)port);
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        fprintf(stderr, "aether: cannot bind port %d\n", port);
+        exit(3);
+    }
+    if (listen(listener, 16) != 0) {
+        fprintf(stderr, "aether: listen() failed\n");
+        exit(3);
+    }
+
+    ae_event("{\"event\":\"serve_start\",\"port\":%d,\"route\":\"%s\",\"in_dim\":%d,\"out_dim\":%d,\"backend\":\"c\"}",
+             port, route, model->in_dim, model->out_dim);
+    ae_human("  [serve]  http://127.0.0.1:%d%s | POST {\"features\":[...]} | GET /health",
+             port, route);
+
+    time_t deadline = serve_seconds > 0 ? time(NULL) + serve_seconds : 0;
+    long requests = 0;
+    while (!ae_shutdown) {
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 200 * 1000;
+        fd_set readers;
+        FD_ZERO(&readers);
+        FD_SET(listener, &readers);
+        int ready = select((int)listener + 1, &readers, NULL, NULL, &tv);
+        if (ae_shutdown) break;
+        if (deadline && time(NULL) >= deadline) break;
+        if (ready <= 0 || !FD_ISSET(listener, &readers)) continue;
+        ae_socket_t client = accept(listener, NULL, NULL);
+        if (client == AE_INVALID_SOCKET) continue;
+        AeConn *conn = (AeConn *)malloc(sizeof(AeConn));
+        if (!conn) {
+            AE_CLOSE_SOCKET(client);
+            continue;
+        }
+        conn->fd = client;
+        conn->model = model;
+        snprintf(conn->route, sizeof(conn->route), "%s", route);
+#ifdef _WIN32
+        uintptr_t thread = _beginthreadex(NULL, 0, ae_conn_trampoline, conn, 0, NULL);
+        if (thread) {
+            CloseHandle((HANDLE)thread);
+        } else {
+            free(conn);
+        }
+#else
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, ae_conn_trampoline, conn) == 0) {
+            pthread_detach(thread);
+        } else {
+            free(conn);
+        }
+#endif
+        requests++;
+    }
+
+    AE_CLOSE_SOCKET(listener);
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    ae_event("{\"event\":\"serve_stop\",\"port\":%d,\"requests\":%ld,\"backend\":\"c\"}", port, requests);
+    ae_human("  [serve]  stopped | %ld request(s) served", requests);
+}
 '''
 
 
@@ -962,6 +1365,8 @@ def _types(task: Task) -> dict[str, tuple[str, str]]:
             known[stmt.name or ""] = ("model", "mlp")
         elif call.name == "classifier":
             known[stmt.name or ""] = ("model", "classifier")
+        elif call.name == "load_model":
+            known[stmt.name or ""] = ("model", "served")
         elif call.name == "run":
             known[stmt.name or ""] = ("stream", "")
     return known
@@ -1013,6 +1418,15 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
             f"ae_model_new({_int(bound.get('in'))}, {_int(bound.get('hidden'), 128)}, "
             f"{_int(bound.get('classes'))}, 1)"
         )
+    if node.name == "load_model":
+        bound = _bind(node, ["path"])
+        node_path = bound.get("path")
+        text = (
+            node_path.value
+            if isinstance(node_path, Literal) and isinstance(node_path.value, str)
+            else "model.ae.bin"
+        )
+        return f'ae_model_load("{_c_string(text)}")'
     if node.name == "run":
         return _run_expr(node, known, chunks)
     raise CBackendError(f"intent '{node.name}' is not supported by the C backend yet")
@@ -1110,6 +1524,18 @@ def _stmt_c(
     if stmt.kind == "export":
         path = _c_string((stmt.path or "").replace("\\", "/"))
         return [f'    ae_export(&{stmt.target}, "{path}");']
+
+    if stmt.kind == "serve":
+        route = "/predict"
+        for mod in stmt.modifiers:
+            if mod.name == "route" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, str):
+                    route = value.value
+                    break
+        return [
+            f'    ae_http_serve(&{stmt.target}, {stmt.port or 8080}, "{_c_string(route)}");'
+        ]
 
     if stmt.kind == "expr" and isinstance(stmt.expr, Call) and stmt.expr.name == "run":
         return [f"    {_run_expr(stmt.expr, known, chunks)};"]
@@ -1222,10 +1648,24 @@ def compile_c(
     toolchain: Toolchain,
     threads: int = 16,
 ) -> BuildResult:
+    import hashlib
+
     out_dir.mkdir(parents=True, exist_ok=True)
     source_file = out_dir / f"{stem}.c"
     source_file.write_text(source, encoding="utf-8", newline="\n")
     binary = out_dir / (f"{stem}.exe" if os.name == "nt" else stem)
+    stamp = out_dir / f"{stem}.aebuild"
+
+    # Compile cache: skip the compiler when the emitted source is unchanged.
+    digest = hashlib.sha256(source.encode("utf-8")).hexdigest()[:24]
+    if binary.is_file() and stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == digest:
+        return BuildResult(
+            source_file=source_file,
+            binary=binary,
+            compile_ms=0.0,
+            command="(cached: source unchanged)",
+            toolchain=toolchain,
+        )
 
     if toolchain.kind == "msvc":
         command = [
@@ -1263,6 +1703,8 @@ def compile_c(
                 f"-L{toolchain.lib_dir}",
                 "-lopenblas",
             ]
+        if os.name == "nt":
+            command += ["-lws2_32"]
 
     started = time.perf_counter()
     proc = subprocess.run(command, capture_output=True, text=True, errors="replace")
@@ -1277,6 +1719,7 @@ def compile_c(
         )
 
     _copy_runtime_dll(toolchain, out_dir)
+    stamp.write_text(digest, encoding="utf-8", newline="\n")
     return BuildResult(
         source_file=source_file,
         binary=binary,

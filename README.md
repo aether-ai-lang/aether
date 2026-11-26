@@ -5,32 +5,58 @@
 ### *The First Programming Language Built for AI Agents, Not Human Typists.*
 
 You declare **what** the AI workload is. Aether decides **how** to run it — and emits
-standalone, multi-threaded **C99 machine code**. No Python at runtime. No boilerplate
-for your agent to type.
+standalone, multi-threaded **C99 machine code**: training jobs, streaming inference,
+and now **native HTTP/JSON model servers**. Zero Python at runtime. Your agent drives
+the whole toolchain over **MCP**.
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
-![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP-orange)
+![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
 ![blas](https://img.shields.io/badge/BLAS-OpenBLAS%20%7C%20blocked--sgemm-red)
+![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
 ![python](https://img.shields.io/badge/python%20fallback-3.10%2B-informational)
-![tests](https://img.shields.io/badge/tests-19%2F19-brightgreen)
+![tests](https://img.shields.io/badge/tests-25%2F25-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
-**Train a classifier. Export the weights. Evaluate on a stream. Seven lines.**
+**Train a classifier. Export the weights. Serve them as a JSON API. Four lines.**
 
 ```aether
 use ai.core
+use web.core
 
-task TrainAgent:
-    dataset = load_data(samples: 10000, features: 128) -> auto_hardware
-    model = classifier(in: 128, classes: 10) -> optimize(speed: max)
-    train model on dataset(epochs: 5) -> self_heal
-    export model -> "model.ae.bin"
-    run model(dataset) -> stream_output
+task ServeAI:
+    model = load_model("model.ae.bin") -> auto_hardware
+    serve model on port(8080) -> route("/predict")
 ```
 
 </div>
 
 ---
+
+## v0.3 — Full-Stack Aether
+
+v0.2 proved agents can *train* models in 7 lines. v0.3 lets them **ship** them:
+
+- **`web.core` / `serve` intent** — `aether run examples/serve_ai_api.ae` compiles to a
+  standalone **native C99 HTTP/JSON inference server** (Winsock2 on Windows, POSIX
+  sockets elsewhere, one thread per connection). The Python backend serves the
+  identical API via the standard library. Same 4 lines, same endpoints.
+- **`load_model("model.ae.bin")`** — load an exported **AEB1** model into any task.
+- **`aether mcp`** — a native **Model Context Protocol** server (JSON-RPC 2.0 over
+  stdio) exposing check / fix / compile / run / spec / bench to AI coding agents.
+
+## Live native inference
+
+```powershell
+aether run examples/serve_ai_api.ae          # this binary IS the server
+#   [model]  loaded model.ae.bin | 128 -> 128 -> 10 | 17802 params | AEB1
+#   [serve]  http://127.0.0.1:8080/predict | POST {"features":[...]} | GET /health
+
+curl -X POST http://127.0.0.1:8080/predict -d "{\"features\": [0.01, 0.02, ...]}"
+# {"prediction":6,"confidence":0.636,"probabilities":[...],"in_dim":128,"out_dim":10,"elapsed_ms":0.09}
+```
+
+Sub-0.1 ms per request, straight from machine code. `GET /health` reports model
+facts; malformed requests get structured `400`s; unknown routes get `404`s.
 
 ## The number that matters
 
@@ -91,35 +117,37 @@ Copy-Item aether.cmd "$env:USERPROFILE\bin\"
 ## Architecture
 
 ```
-              your AI agent writes 7 lines of intent (.ae)
-                                  |
-                                  v
-   +----------------------------------------------------------------+
-   |                       aether compiler                          |
-   |   lexer -> parser -> type checker -> fix_patch synthesis       |
-   |   (errors are JSON + unified diffs an agent can apply itself)  |
-   +----------------+------------------------------+----------------+
-                    | --target=c  (default)        | --target=python
+        your AI agent writes 4-7 lines of intent (.ae)  ──or──  speaks MCP
+                                  |                                  |
+                                  v                                  v
+   +----------------------------------------------------------------+-----------+
+   |                       aether compiler                          |  aether   |
+   |   lexer -> parser -> type checker -> fix_patch synthesis       |  mcp      |
+   |   (errors are JSON + unified diffs an agent can apply itself)  |  (stdio   |
+   +----------------+------------------------------+----------------+  JSON-RPC) |
+                    | --target=c  (default)        | --target=python  +-----------+
                     v                              v
    +--------------------------------+   +---------------------------+
-   |  .aether_build/train_agent.c   |   | .aether_build/train.py    |
+   |  .aether_build/<name>.c        |   | .aether_build/<name>.py   |
    |  standalone C99, no runtime    |   | NumPy / OpenBLAS backend  |
    |  deps beyond libc + OpenMP     |   +-------------+-------------+
    +----------------+---------------+                 |
                     | gcc -O3 -march=native           |
-                    |     -fopenmp (+OpenBLAS)        |
+                    |     -fopenmp (+OpenBLAS,        |
+                    |      -lws2_32 on Windows)       |
                     v                                 |
    +--------------------------------+                 |
-   |  .aether_build/train_agent.exe |                 |
+   |  .aether_build/<name>.exe      |                 |
    |  OpenMP threads                |                 |
    |  adaptive BLAS thread pool     |                 |
    |  fused bias+ReLU               |                 |
-   |  AEB1 model export             |                 |
+   |  AEB1 load / export            |                 |
+   |  native HTTP/JSON server       |                 |
    +----------------+---------------+                 |
                     |                                 |
                     v                                 v
    +----------------------------------------------------------------+
-   |   live chunk events  |  JSON payloads  |  self-healing patches  |
+   |  live chunk events | JSON payloads | HTTP | self-healing patches|
    +----------------------------------------------------------------+
 ```
 
@@ -140,6 +168,34 @@ Aether is built around three ideas:
    no model round-trip wasted on re-reading the whole file.
 3. **The runtime is a machine-code artifact.** `aether run` emits C, compiles it,
    and executes the binary. Agents don't ship an interpreter; they ship a plan.
+
+## MCP: agents driving Aether natively
+
+`aether mcp` speaks the Model Context Protocol (JSON-RPC 2.0, newline-delimited,
+stdio) — plug it into OpenCode, Claude Code, Cursor, or any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "aether": {
+      "command": "python",
+      "args": ["aether.py", "mcp"]
+    }
+  }
+}
+```
+
+| Tool | What the agent can do |
+|---|---|
+| `aether_check` | validate any `.ae` file and read structured diagnostics |
+| `aether_fix` | **auto-apply the combined self-healing patch**, then re-validate |
+| `aether_compile` | emit + compile the native C binary (or Python artifact) |
+| `aether_run` | execute a task and read the machine-readable result |
+| `aether_spec` | pull the language spec (whole or per-section) into context |
+| `aether_bench` | measure tokens / lines / speed against Python & PyTorch |
+
+The full loop — *write → check → heal → compile → run → serve* — happens inside the
+agent's tool loop, with no human keystrokes.
 
 ## The language in 5 lines (inference)
 
@@ -203,21 +259,24 @@ aether run <file.ae>    [--target auto|c|python] [--cc PATH] [--task NAME]
                         [--chunks N] [--json] [--emit-only] [--build-dir DIR]
 aether check <file.ae>  [--compact]
 aether bench <file.ae>  [--task NAME] [--repeat N] [--threads N] [--json]
+aether mcp              # Model Context Protocol server for AI agents
 aether version
 ```
 
 Exit codes: `0` success · `1` compile error · `2` usage/file error · `3` runtime error.
-`--json` makes `run`, `check`, and `bench` fully machine-readable.
+`--json` makes `run`, `check`, and `bench` fully machine-readable. Serving tasks
+block by design — `aether run` *is* the server; Ctrl+C stops it.
 
 ## Backends
 
 | | `--target=c` (default) | `--target=python` |
 |---|---|---|
 | Artifact | `.aether_build/<name>.c` → `.exe` | `.aether_build/<name>.py` |
-| Runtime deps | libc + OpenMP (+ OpenBLAS if found) | NumPy/OpenBLAS |
-| Threading | OpenMP + adaptive BLAS pool | OpenBLAS |
+| Runtime deps | libc + OpenMP + Winsock2/POSIX sockets (+ OpenBLAS if found) | NumPy + stdlib |
+| Threading | OpenMP + adaptive BLAS pool + thread-per-connection | OpenBLAS + threaded HTTP |
 | Streaming | native, live per-chunk output | live per-chunk output |
 | Training | SGD+momentum, self-healing guards | same semantics |
+| HTTP serving | native C99 JSON API | identical API, stdlib server |
 | Model format | AEB1 (identical bytes) | AEB1 (identical bytes) |
 
 Aether finds gcc/clang/MSVC via `PATH`, `$AETHER_CC`, or a portable toolchain at
@@ -232,15 +291,17 @@ AETHER_SPEC.md               language specification (grammar, intents, error con
 aether.py / aether.cmd       CLI entrypoints
 aetherc/                     the compiler
   lexer.py parser.py ast_nodes.py    front end (indentation-aware, 4-space blocks)
-  checker.py diagnostics.py          type rules + fix_patch synthesis
+  checker.py diagnostics.py          type rules + fix_patch synthesis + patch application
   codegen.py                         Python/NumPy backend
-  cbackend.py                        C99 backend + toolchain discovery
-  runtime.py                         NumPy runtime (devices, training, streaming)
+  cbackend.py                        C99 backend: OpenMP, OpenBLAS, HTTP server
+  runtime.py                         NumPy runtime (devices, training, streaming, serving)
+  mcp.py                             MCP server (JSON-RPC over stdio)
   bench.py bench/                    benchmark orchestration + hand-written references
 hello_aether.ae              5-line inference demo
 examples/train_ai_agent.ae   the training demo used by `aether bench`
+examples/serve_ai_api.ae     the 4-line HTTP serving demo
 examples/self_heal.ae        intentionally broken file for the healing demo
-tests/test_aether.py         19 end-to-end tests
+tests/test_aether.py         end-to-end tests (both backends, HTTP, MCP)
 ```
 
 ## Tests
@@ -249,17 +310,18 @@ tests/test_aether.py         19 end-to-end tests
 python -m unittest discover -s tests -v
 ```
 
-19 end-to-end tests: compile and run on **both** backends, standalone-C emission,
-training + AEB1 export parity, classifier diagnostics with patches, JSON contracts,
-bench output, native-default detection, and applying the combined self-heal patch
-with `git apply`.
+End-to-end coverage: compile and run on **both** backends, standalone-C emission,
+training + AEB1 export parity, **live HTTP inference against the compiled native
+server and the Python server**, MCP initialize/tools/fix/compile/spec flows, patch
+application, classifier diagnostics with patches, JSON contracts, bench output, and
+applying the combined self-heal patch with `git apply`.
 
-## Roadmap (v0.3+)
+## Roadmap (v0.4+)
 
 - Loops, conditionals, and arithmetic over tensors in the intent graph
 - GPU backend behind `auto_hardware` (the binding is already the language contract)
-- `load` intent to read AEB1 models back into a task
-- Importable intent packs beyond `ai.core`
+- HTTPS/TLS and streaming (chunked) responses in `web.core`
+- Importable intent packs beyond `ai.core` / `web.core`
 - Deterministic cross-backend parity tests (bit-identical digests)
 
 ## License

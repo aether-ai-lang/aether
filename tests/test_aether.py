@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -15,7 +16,12 @@ PY = sys.executable
 sys.path.insert(0, str(ROOT))
 
 
-def run_cli(*args: str, cwd: pathlib.Path = ROOT) -> subprocess.CompletedProcess:
+def run_cli(
+    *args: str, cwd: pathlib.Path = ROOT, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
+    environment = dict(os.environ)
+    if env:
+        environment.update(env)
     return subprocess.run(
         [PY, str(ROOT / "aether.py"), *args],
         cwd=cwd,
@@ -23,6 +29,7 @@ def run_cli(*args: str, cwd: pathlib.Path = ROOT) -> subprocess.CompletedProcess
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=environment,
     )
 
 
@@ -189,7 +196,9 @@ class AetherCliTests(unittest.TestCase):
         )
         checked = run_cli("check", str(path))
         self.assertEqual(checked.returncode, 0, checked.stdout)
-        result = run_cli("run", str(path), "--task", "Second", "--json")
+        # Python target: exercises task selection + emit events without a
+        # fresh C compile (native selection is covered by test_native_run_is_default).
+        result = run_cli("run", str(path), "--task", "Second", "--target", "python", "--json")
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
         self.assertTrue(any(event["event"] == "emit_tensor" for event in payload["events"]))
@@ -304,8 +313,10 @@ class AetherCliTests(unittest.TestCase):
     def test_bench_reports_comparison(self) -> None:
         from aetherc.cbackend import find_toolchain
 
+        # Skip the (multi-second) PyTorch reference in unit tests: point the
+        # bench at a directory that has no torch install.
         args = ["bench", "examples/train_ai_agent.ae", "--repeat", "1", "--json"]
-        result = run_cli(*args)
+        result = run_cli(*args, env={"AETHER_TORCH_PATH": "skipped-for-tests"})
         self.assertEqual(result.returncode, 0, result.stdout[-3000:])
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
@@ -338,6 +349,363 @@ class AetherCliTests(unittest.TestCase):
         self.assertEqual(workload.classes, 10)
         self.assertEqual(workload.hidden, 128)
         self.assertEqual(workload.epochs, 5)
+
+    # ------------------------------------------------------------------ v0.3
+    def test_serve_requires_web_core_and_route(self) -> None:
+        path = write_temp(
+            "use ai.core\n"
+            "\n"
+            "task BadServe:\n"
+            '    model = load_model("model.ae.bin") -> auto_hardware\n'
+            "    serve model on port(8080)\n"
+        )
+        payload = json.loads(run_cli("check", str(path)).stdout)
+        self.assertEqual(payload["status"], "error")
+        codes = [d["code"] for d in payload["diagnostics"]]
+        self.assertIn("AE0200", codes)  # missing use web.core
+        self.assertIn("AE0300", codes)  # missing route
+        self.assertIn("use web.core", payload["fix_patch"])
+        self.assertIn('route("/predict")', payload["fix_patch"])
+
+    def test_load_model_contracts(self) -> None:
+        path = write_temp(
+            "use ai.core\n"
+            "use web.core\n"
+            "\n"
+            "task NeedsPatch:\n"
+            "    model = load_model(\"model.ae.bin\")\n"
+            '    serve model on port(8080) -> route("/predict")\n'
+        )
+        payload = json.loads(run_cli("check", str(path)).stdout)
+        self.assertEqual(payload["status"], "error")
+        self.assertTrue(any(d["code"] == "AE0300" for d in payload["diagnostics"]))
+        self.assertIn("-> auto_hardware", payload["fix_patch"])
+
+        bad = write_temp(
+            "use ai.core\n"
+            "use web.core\n"
+            "\n"
+            "task Unquoted:\n"
+            "    model = load_model(8080) -> auto_hardware\n"
+            '    serve model on port(8080) -> route("/predict")\n'
+        )
+        payload = json.loads(run_cli("check", str(bad)).stdout)
+        self.assertTrue(
+            any(d["code"] == "AE0212" for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+        self.assertTrue(
+            any("quoted path" in d["message"] for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+
+        served = write_temp(
+            "use ai.core\n"
+            "\n"
+            "task CannotRun:\n"
+            '    model = load_model("model.ae.bin") -> auto_hardware\n'
+            "    run model(model) -> stream_output\n"
+        )
+        payload = json.loads(run_cli("check", str(served)).stdout)
+        self.assertTrue(
+            any("no compile-time shape" in d["message"] for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+
+    @staticmethod
+    def _free_port() -> int:
+        import socket
+
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
+    @classmethod
+    def _http(cls, url: str, body: bytes | None = None, timeout: float = 5.0):
+        import urllib.error
+        import urllib.request
+
+        request = urllib.request.Request(url, data=body)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    @classmethod
+    def _ensure_serve_model(cls) -> None:
+        model = ROOT / "examples" / "model.ae.bin"
+        if not model.is_file():
+            result = run_cli("run", "examples/train_ai_agent.ae", "--target", "python", "--json")
+            assert result.returncode == 0, result.stdout[-1000:]
+
+    def test_native_http_inference(self) -> None:
+        from aetherc.cbackend import compile_c, find_toolchain, generate_for_toolchain
+        from aetherc.lexer import tokenize
+        from aetherc.parser import parse
+
+        toolchain = find_toolchain()
+        if toolchain is None:
+            self.skipTest("no C compiler available")
+        cls = type(self)
+        cls._ensure_serve_model()
+
+        source_name = "examples/serve_ai_api.ae"
+        source = (ROOT / source_name).read_text(encoding="utf-8-sig")
+        program = parse(tokenize(source, source_name), source_name, source)
+        generated = generate_for_toolchain(program, "serve_ai_api.ae", toolchain, None, chunks=8)
+        native = compile_c(
+            generated, ROOT / "examples" / ".aether_build", "serve_ai_api", toolchain
+        )
+
+        port = cls._free_port()
+        env = dict(
+            os.environ,
+            AETHER_PORT=str(port),
+            AETHER_SERVE_SECONDS="15",
+            AETHER_BASE_DIR=str((ROOT / "examples").resolve()),
+        )
+        proc = subprocess.Popen(
+            [str(native.binary)],
+            env=env,
+            cwd=str(native.binary.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            base = f"http://127.0.0.1:{port}"
+            status, health = None, None
+            import time
+
+            for _ in range(60):
+                time.sleep(0.1)
+                try:
+                    status, health = cls._http(f"{base}/health", timeout=2)
+                    break
+                except Exception:
+                    continue
+            self.assertEqual(status, 200, "server did not become healthy")
+            self.assertEqual(health["status"], "ok")
+            self.assertEqual(health["in_dim"], 128)
+            self.assertEqual(health["out_dim"], 10)
+
+            features = [0.01 * i for i in range(128)]
+            status, prediction = cls._http(
+                f"{base}/predict",
+                body=json.dumps({"features": features}).encode(),
+            )
+            self.assertEqual(status, 200)
+            self.assertIsInstance(prediction["prediction"], int)
+            self.assertTrue(0 <= prediction["prediction"] < 10)
+            self.assertEqual(len(prediction["probabilities"]), 10)
+            self.assertLess(prediction["elapsed_ms"], 50.0)
+
+            status, _ = cls._http(f"{base}/nope", body=b"{}")
+            self.assertEqual(status, 404)
+            status, error = cls._http(
+                f"{base}/predict", body=json.dumps({"features": [1, 2, 3]}).encode()
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("128", error["error"])
+        finally:
+            # Kill immediately: AETHER_SERVE_SECONDS would otherwise keep the
+            # process alive and stall the suite for the full window.
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def test_python_http_inference(self) -> None:
+        cls = type(self)
+        cls._ensure_serve_model()
+        port = cls._free_port()
+        env = dict(os.environ, AETHER_PORT=str(port))
+        proc = subprocess.Popen(
+            [
+                PY,
+                str(ROOT / "aether.py"),
+                "run",
+                "examples/serve_ai_api.ae",
+                "--target",
+                "python",
+            ],
+            env=env,
+            cwd=str(ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            import time
+
+            base = f"http://127.0.0.1:{port}"
+            status, health = None, None
+            for _ in range(60):
+                time.sleep(0.1)
+                try:
+                    status, health = cls._http(f"{base}/health", timeout=2)
+                    break
+                except Exception:
+                    continue
+            self.assertEqual(status, 200)
+            self.assertEqual(health["status"], "ok")
+            status, prediction = cls._http(
+                f"{base}/predict", body=json.dumps({"features": [0.1] * 128}).encode()
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(0 <= prediction["prediction"] < 10)
+        finally:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def test_apply_patch_round_trip(self) -> None:
+        from aetherc.diagnostics import apply_patch, replace_line_patch
+
+        source = "use ai.core\n\ntask T:\n    x = tensor(8, 8)\n"
+        patch = replace_line_patch("t.ae", source.splitlines(), 4, "    x = tensor(8, 8) -> auto_hardware")
+        self.assertIsNotNone(patch)
+        patched = apply_patch(patch, source)
+        self.assertIsNotNone(patched)
+        self.assertIn("-> auto_hardware", patched)
+        self.assertEqual(len(patched.splitlines()), 4)
+        self.assertIsNone(apply_patch(patch, "totally different\n"))
+
+    def test_mcp_initialize_tools_fix_and_compile(self) -> None:
+        import tempfile
+
+        directory = pathlib.Path(tempfile.mkdtemp(prefix="aether_mcp_test_"))
+        broken = directory / "broken.ae"
+        broken.write_text("use ai\n\ntask T:\n    x = tensor(8, 8)\n", newline="\n")
+
+        proc = subprocess.Popen(
+            [PY, str(ROOT / "aether.py"), "mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(ROOT),
+        )
+
+        def rpc(message: dict) -> dict:
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+            if not line:
+                raise AssertionError("MCP server closed the pipe (see stderr)")
+            return json.loads(line)
+
+        def notify(message: dict) -> None:
+            # Notifications get no response by protocol; reading would block.
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+
+        try:
+            init = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2024-11-05"},
+                }
+            )
+            self.assertEqual(init["result"]["serverInfo"]["name"], "aether")
+            self.assertEqual(init["result"]["serverInfo"]["version"], "0.3")
+            notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+            names = {tool["name"] for tool in tools["result"]["tools"]}
+            self.assertLessEqual(
+                {
+                    "aether_check",
+                    "aether_fix",
+                    "aether_compile",
+                    "aether_run",
+                    "aether_spec",
+                    "aether_bench",
+                },
+                names,
+            )
+
+            check = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "aether_check", "arguments": {"file": str(broken)}},
+                }
+            )
+            check_payload = json.loads(check["result"]["content"][0]["text"])
+            self.assertEqual(check_payload["status"], "error")
+            self.assertTrue(check_payload["diagnostics"])
+
+            fix = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "aether_fix",
+                        "arguments": {"file": str(broken), "apply": True},
+                    },
+                }
+            )
+            fix_payload = json.loads(fix["result"]["content"][0]["text"])
+            self.assertTrue(fix_payload["applied"])
+            self.assertLess(fix_payload["after"]["errors"], fix_payload["before"]["errors"])
+
+            compile_call = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "aether_compile",
+                        "arguments": {"file": "hello_aether.ae", "target": "python"},
+                    },
+                }
+            )
+            compile_payload = json.loads(compile_call["result"]["content"][0]["text"])
+            self.assertEqual(compile_payload["status"], "ok")
+            self.assertTrue(pathlib.Path(compile_payload["artifact"]).is_file())
+
+            spec = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 6,
+                    "method": "tools/call",
+                    "params": {"name": "aether_spec", "arguments": {}},
+                }
+            )
+            spec_text = spec["result"]["content"][0]["text"]
+            self.assertIn("Language Specification", spec_text)
+
+            unknown = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "tools/call",
+                    "params": {"name": "nope", "arguments": {}},
+                }
+            )
+            self.assertEqual(unknown["error"]["code"], -32602)
+        finally:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                proc.kill()
 
 
 if __name__ == "__main__":

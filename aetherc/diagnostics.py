@@ -6,7 +6,7 @@ import difflib
 import re
 from dataclasses import dataclass
 
-AETHER_VERSION = "0.2"
+AETHER_VERSION = "0.3"
 
 
 @dataclass
@@ -172,6 +172,29 @@ def merged_fix_patch(path: str, lines: list[str], diagnostics: list) -> str | No
         cursor = end
     result.extend(lines[cursor:])
     return unified_patch(path, lines, result)
+
+
+def apply_patch(patch_text: str, source: str) -> str | None:
+    """Apply one of Aether's unified diffs to source text.
+
+    Returns the patched source, or None when the patch does not apply
+    (context mismatch). This powers `aether mcp` self-healing.
+    """
+    lines = source.splitlines()
+    edits = _patch_edits(patch_text, lines)
+    if not edits:
+        return None
+    result: list[str] = []
+    cursor = 0
+    for start, end, replacement in sorted(edits, key=lambda item: (item[0], item[1])):
+        if start < cursor:
+            return None
+        result.extend(lines[cursor:start])
+        result.extend(replacement)
+        cursor = end
+    result.extend(lines[cursor:])
+    trailing = "\n" if source.endswith("\n") else ""
+    return "\n".join(result) + trailing
 
 
 class AetherError(Exception):

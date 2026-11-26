@@ -310,6 +310,18 @@ def make_printer(ui: UI):
                 f"  [emit]   stream[{event['rows']}x{event['out_dim']}] "
                 f"checksum={event['checksum']:+.2f} digest={event['digest']}{accuracy}"
             )
+        elif kind == "serve_start":
+            print(
+                f"  [serve]  http://127.0.0.1:{event['port']}{event['route']} | "
+                f"POST {{\"features\":[...]}} | GET /health"
+            )
+        elif kind == "request" and "prediction" in event:
+            print(
+                f"  [request] POST {event['path']} | pred {event['prediction']} "
+                f"({event['confidence']:.3f}) | {event['ms']:.2f} ms"
+            )
+        elif kind == "serve_stop":
+            print(f"  [serve]  stopped")
         sys.stdout.flush()
 
     return printer
@@ -678,7 +690,10 @@ def _run_native(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
-        description="Aether 0.2 - intent-driven AI-agent-native compiler (Python + native C backends)",
+        description=(
+            "Aether 0.3 - intent-driven AI-agent-native compiler "
+            "(native C99 + Python backends, HTTP serving, MCP server)"
+        ),
     )
     parser.add_argument(
         "--version", action="version", version=f"aether {AETHER_VERSION}"
@@ -730,6 +745,12 @@ def build_parser() -> argparse.ArgumentParser:
     bench_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     bench_parser.set_defaults(func=_cmd_bench)
 
+    mcp_parser = subparsers.add_parser(
+        "mcp",
+        help="run the Aether MCP server (JSON-RPC over stdio) for AI coding agents",
+    )
+    mcp_parser.set_defaults(func=_cmd_mcp)
+
     version_parser = subparsers.add_parser("version", help="print the compiler version")
     version_parser.set_defaults(func=lambda args: _print_version())
 
@@ -740,6 +761,12 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     from .bench import run_bench
 
     return run_bench(args)
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp import run_mcp
+
+    return run_mcp()
 
 
 def _print_version() -> int:

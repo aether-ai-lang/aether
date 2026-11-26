@@ -179,6 +179,8 @@ class Parser:
             return self.parse_train()
         if self.at_keyword("export"):
             return self.parse_export()
+        if self.at_keyword("serve"):
+            return self.parse_serve()
 
         if self.at_keyword("emit") or self.at_keyword("return"):
             kind = "emit" if token.value == "emit" else "return"
@@ -280,6 +282,54 @@ class Parser:
             column=start.column,
             target=str(model.value),
             path=str(path.value),
+        )
+
+    def parse_serve(self) -> Stmt:
+        start = self.expect("IDENT", "serve")
+        model = self.expect(
+            "IDENT", hint='Use: serve model on port(8080) -> route("/predict")'
+        )
+        if not self.at_keyword("on"):
+            token = self.peek()
+            raise AetherError(
+                f"Expected 'on' after model name, found {self.describe(token)}",
+                token.line,
+                token.column,
+                code="AE0100",
+                hint='Serving syntax: serve model on port(8080) -> route("/predict")',
+            )
+        self.advance()
+        port_word = self.expect(
+            "IDENT", "port", hint='Serving syntax: serve model on port(8080) -> route("/predict")'
+        )
+        self.expect("PUNCT", "(")
+        port = self.expect(
+            "NUMBER",
+            hint="The port must be an integer literal, e.g. port(8080).",
+        )
+        if not isinstance(port.value, int):
+            raise AetherError(
+                "Port must be an integer",
+                port.line,
+                port.column,
+                code="AE0212",
+                hint="Use a whole number such as port(8080).",
+            )
+        self.expect("PUNCT", ")")
+
+        modifiers: list[Modifier] = []
+        while self.at("ARROW"):
+            modifiers.append(self.parse_modifier())
+        self.expect("NEWLINE")
+
+        return Stmt(
+            kind="serve",
+            expr=None,
+            line=start.line,
+            column=start.column,
+            target=str(model.value),
+            port=int(port.value),
+            modifiers=modifiers,
         )
 
     # ------------------------------------------------------------ expressions

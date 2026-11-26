@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ast_nodes import Call, Literal
+from .bootstrap import entry_command
 from .cli import analyze, print_json
 from .diagnostics import AETHER_VERSION
 from .lexer import tokenize
@@ -209,17 +210,9 @@ def run_aether_python(path: Path, task: str, threads: int, repeat: int) -> list[
     runs: list[dict] = []
     for _ in range(repeat):
         proc = subprocess.run(
-            [
-                sys.executable,
-                str(ROOT / "aether.py"),
-                "run",
-                str(path),
-                "--task",
-                task,
-                "--target",
-                "python",
-                "--json",
-            ],
+            entry_command(
+                "run", str(path), "--task", task, "--target", "python", "--json"
+            ),
             capture_output=True,
             text=True,
             cwd=str(ROOT),

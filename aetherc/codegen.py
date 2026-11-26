@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Program, Stmt, Task, Unary
 from .diagnostics import AETHER_VERSION
 
 _USER_FNS: set[str] = set()
+_MEMORY_FILE: str = "agent.memory.json"
 
 
 def _bind(call: Call, names: list[str]) -> dict[str, object]:
@@ -113,6 +116,26 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
             f"rt.save_json({_value_src(bound.get('value'))}, "
             f"{_value_src(bound.get('path'))})"
         )
+    if call.name == "remember":
+        bound = _bind(call, ["key", "value"])
+        return (
+            f"rt.remember({_value_src(bound.get('key'))}, "
+            f"{_expr_src(bound.get('value'), task_policy)}, {_MEMORY_FILE!r})"
+        )
+    if call.name == "recall":
+        bound = _bind(call, ["key", "default"])
+        default = (
+            _expr_src(bound.get("default"), task_policy)
+            if "default" in bound
+            else "0.0"
+        )
+        return (
+            f"rt.recall({_value_src(bound.get('key'))}, "
+            f"{default}, {_MEMORY_FILE!r})"
+        )
+    if call.name in ("mean", "sum"):
+        bound = _bind(call, ["value"])
+        return f"rt.{call.name}({_value_src(bound.get('value'))})"
     if call.name == "load_model":
         bound = _bind(call, ["path"])
         return f"rt.load_model({_value_src(bound.get('path'))})"
@@ -269,8 +292,10 @@ def _fn_def(fn: Function, program: Program) -> list[str]:
 def generate(program: Program, source_name: str) -> str:
     """Return a Python module implementing the compiled task graph."""
 
+    global _MEMORY_FILE
     _USER_FNS.clear()
     _USER_FNS.update(fn.name for fn in program.functions)
+    _MEMORY_FILE = Path(source_name).stem + ".memory.json"
 
     task_names = [task.name for task in program.tasks]
     plan = {

@@ -1,0 +1,20 @@
+use ai.core
+use data.core
+use agent.core
+
+task SmartAgent:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    probe = tensor(16, 16) -> auto_hardware
+    log sum(probe)
+    log mean(probe)
+    let prev = recall("best_acc", default: 0.0)
+    log prev
+    while accuracy < prev + 0.03 max_iters(4):
+        train model on dataset(epochs: 2) -> self_heal
+    if accuracy > prev:
+        log "improved"
+        remember("best_acc", accuracy)
+    else:
+        log "no improvement"
+    log accuracy

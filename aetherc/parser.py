@@ -626,10 +626,10 @@ class Parser:
         ):
             name_token = self.advance()
             self.advance()  # ':'
-            value = self.parse_value()
+            value = self.parse_expr()
             return Arg(str(name_token.value), value, name_token.line, name_token.column)
 
-        value = self.parse_value()
+        value = self.parse_expr()
         return Arg(None, value, token.line, token.column)
 
     def parse_value(self) -> object:

@@ -2,11 +2,15 @@
 .aether_build/
 __pycache__/
 *.py[cod]
+build/
+dist/
+*.spec
 
 # Compiled binaries and model weights
 *.exe
 *.bin
 examples/report.json
+*.memory.json
 
 # OS / editor noise
 .DS_Store

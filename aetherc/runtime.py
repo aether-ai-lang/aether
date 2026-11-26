@@ -150,6 +150,7 @@ class Runtime:
         self.device = detect_device()
         self.base_dir = Path(base_dir) if base_dir else Path.cwd()
         self._buffer_cache: dict[tuple[int, int, int], tuple[np.ndarray, np.ndarray]] = {}
+        self._memory_cache: dict[str, dict] = {}
         self._emit_event("device", **self.device)
 
     def _emit_event(self, event: str, **payload: object) -> None:
@@ -1057,6 +1058,83 @@ class Runtime:
             max_iters=int(max_iters),
             message=f"while loop hit max_iters({int(max_iters)}); exiting",
         )
+
+    # -------------------------------------------------- agent.core memory
+    def _memory_file(self, path: str) -> Path:
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        return target
+
+    def _memory_read(self, path: str) -> dict:
+        import json as _json
+
+        key = str(self._memory_file(path))
+        if key not in self._memory_cache:
+            try:
+                self._memory_cache[key] = _json.loads(
+                    Path(key).read_text(encoding="utf-8-sig")
+                )
+            except (OSError, ValueError):
+                self._memory_cache[key] = {}
+        return self._memory_cache[key]
+
+    def _memory_write(self, path: str, store: dict) -> None:
+        import json as _json
+
+        target = self._memory_file(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            _json.dumps(store, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+
+    def remember(self, key: str, value: float, path: str) -> None:
+        store = self._memory_read(path)
+        previous = store.get(key)
+        store[key] = float(value)
+        self._memory_write(path, store)
+        self._emit_event(
+            "remember",
+            key=key,
+            value=float(value),
+            previous=previous,
+            path=str(self._memory_file(path)),
+        )
+
+    def recall(self, key: str, default: float, path: str) -> float:
+        store = self._memory_read(path)
+        found = key in store
+        value = float(store.get(key, default))
+        self._emit_event(
+            "recall",
+            key=key,
+            found=found,
+            value=value,
+            default=float(default),
+            path=str(self._memory_file(path)),
+        )
+        return value
+
+    # ------------------------------------------------------------ reductions
+    def reduce(self, op: str, tensor: Tensor) -> float:
+        if not isinstance(tensor, Tensor):
+            raise TypeError(f"{op}() reduces a tensor")
+        if op == "mean":
+            value = float(tensor.array.mean(dtype=np.float64))
+        elif op == "sum":
+            value = float(tensor.array.sum(dtype=np.float64))
+        else:
+            raise ValueError(f"unknown reduction '{op}'")
+        self._emit_event("reduce", op=op, value=value, elements=tensor.array.size)
+        return value
+
+    def mean(self, tensor: Tensor) -> float:
+        return self.reduce("mean", tensor)
+
+    def sum(self, tensor: Tensor) -> float:
+        return self.reduce("sum", tensor)
 
     # ------------------------------------------------------------------- logs
     def log(self, value: object) -> None:

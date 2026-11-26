@@ -1,14 +1,16 @@
-# Aether (.ae) — Language Specification v0.5
+# Aether (.ae) — Language Specification v0.6
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
 training run, a stream, an HTTP endpoint); the compiler decides *how* (device, dtype,
-fusion, buffering, threading, even the BLAS thread pool). v0.5 adds **GPU dispatch**
-(`auto_hardware` probes NVIDIA/AMD/Intel hardware and `--target=cuda` compiles CUDA
-kernels when a GPU + nvcc exist), **real data ingestion** (`data.core`: CSV in,
-JSON out, compiled to native C99 file I/O), `while` loops with safety guards, and
-reusable `fn` functions. Programs still compile to **standalone, multi-threaded C**
-(zero Python at runtime) or optimized NumPy/OpenBLAS Python, and `aether mcp`
-exposes the whole toolchain to AI agents.
+fusion, buffering, threading, even the BLAS thread pool). v0.6 makes Aether **100%
+zero-Python standalone**: `python build_standalone.py` produces `dist/aether.exe` —
+a single binary embedding the compiler, the Python backend, and the language spec.
+v0.6 also adds **persistent agent memory** (`remember`/`recall`, compiled to native
+C99 JSON state files that survive across executions) and **tensor reductions**
+(`mean`/`sum` as OpenMP-parallel C loops). Earlier versions brought GPU dispatch
+(`auto_hardware` probes NVIDIA/AMD/Intel; `--target=cuda` compiles CUDA kernels when
+a GPU + nvcc exist), `data.core` CSV/JSON I/O, `while` loops with safety guards,
+`fn` functions, native HTTP serving, and the `aether mcp` agent server.
 
 ## 1. Lexical rules
 
@@ -170,6 +172,9 @@ format is produced by the C and Python backends.
 | `while cond:` / `max_iters(N)` | loops while the comparison holds. A built-in safety guard exits after `N` iterations (default 100,000) and emits a `while_guard` event — agents cannot hang forever. Requires `agent.core`. |
 | `if cond:` / `else:` | runs the first branch whose comparison holds. `cond` must be a comparison (`AE0210` otherwise); `else` is optional. |
 | `log expr` | emits a `log` event with the string or number. |
+| `remember("key", value)` | persists a numeric value to `<source>.memory.json` (created on demand, format documented below). Requires `agent.core`. Emits a `remember` event with the previous value. |
+| `recall("key", default: 0.0)` | reads a persisted value, returning `default` when absent; emits a `recall` event with `found`. Requires `agent.core`. Memory files are plain JSON and portable across the C99 and Python backends — agents literally remember across separate executions. |
+| `mean(tensor)` / `sum(tensor)` | reductions compiled to OpenMP-parallel C loops (`reduction(+:acc)`); both return `float` and emit a `reduce` event. |
 | `fn name(a, b) -> type:` | reusable pure function over numeric scalars; body uses `let/log/if/repeat/while/return`. At least one `return` is required, and the returned type must match the annotation. Compiled to a static C function. |
 | `accuracy` (built-in) | after any `train`, `accuracy` holds the best validation accuracy seen so far — readable in `while` conditions. |
 
@@ -290,6 +295,16 @@ the CUDA toolkit (`nvcc`). Dispatch order for `--target auto`:
 `--target=cuda` on a machine without nvcc falls back to C99 with an explicit
 note in both human output and JSON (`note` field); it never silently fakes GPU
 execution.
+
+### Standalone binary (v0.6)
+
+`python build_standalone.py` (PyInstaller) produces `dist/aether.exe` (or
+`dist/aether`), a single executable bundling the compiler, the Python/NumPy
+backend, and this spec — verified to compile and run `.ae` programs with no
+Python on `PATH`. The native C backend still invokes gcc/clang/MSVC at runtime;
+that is Aether compiling intent to machine code, not a runtime dependency.
+Memory/state file: `<source-stem>.memory.json`, flat JSON object of numeric
+key-value pairs, identical bytes from every backend.
 
 ## 7. Backends and the CLI
 

@@ -25,6 +25,10 @@ KNOWN_INTENTS = (
     "classifier",
     "run",
     "save_json",
+    "remember",
+    "recall",
+    "mean",
+    "sum",
 )
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
@@ -44,6 +48,10 @@ SIGNATURES = {
     "classifier": "classifier(in: D, classes: K, hidden: N?) -> optimize(speed: max|balanced|low)",
     "run": "run model(data) -> stream_output",
     "save_json": 'save_json(value, "out.json")',
+    "remember": 'remember("key", value)',
+    "recall": 'recall("key", default: 0.0)',
+    "mean": "mean(tensor)",
+    "sum": "sum(tensor)",
 }
 
 
@@ -577,6 +585,12 @@ class Checker:
             return self.check_classifier(call, default_policy)
         if call.name == "save_json":
             return self.check_save_json(call, scope)
+        if call.name == "remember":
+            return self.check_remember(call, scope)
+        if call.name == "recall":
+            return self.check_recall(call, scope)
+        if call.name in ("mean", "sum"):
+            return self.check_reduction(call, scope)
         return self.check_run(call, scope)
 
     # ------------------------------------------------------------ intent: tensor
@@ -906,6 +920,102 @@ class Checker:
         if path is None:
             return ERROR
         return Ty("int")
+
+    # -------------------------------------------------------- memory + reductions
+    def check_remember(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_agent_core(call)
+        bound, _ = self.bind(call, [("key", True), ("value", True)])
+
+        key_node = bound.get("key")
+        if not isinstance(key_node, Literal) or not isinstance(key_node.value, str) or not key_node.value:
+            self.error(
+                "AE0212",
+                'remember requires a quoted key, e.g. remember("best_acc", accuracy)',
+                getattr(key_node, "line", call.line),
+                getattr(key_node, "column", call.column),
+                hint='Example: remember("best_acc", accuracy)',
+            )
+        elif len(key_node.value) > 64:
+            self.error(
+                "AE0212",
+                "remember key is too long (max 64 characters)",
+                key_node.line,
+                key_node.column,
+            )
+
+        value = bound.get("value")
+        if value is not None:
+            if isinstance(value, (Name, Binary, Unary)):
+                ty = self.check_expr(value, scope, {})
+                if ty.kind not in ("int", "float"):
+                    self.error(
+                        "AE0210",
+                        f"cannot remember {self.article(ty.kind)}",
+                        getattr(value, "line", call.line),
+                        getattr(value, "column", call.column),
+                        hint="v0.6 memory stores numbers (int/float).",
+                    )
+            elif not (isinstance(value, Literal) and isinstance(value.value, (int, float))):
+                self.error(
+                    "AE0212",
+                    "remember value must be a number or numeric expression",
+                    getattr(value, "line", call.line),
+                    getattr(value, "column", call.column),
+                    hint='Example: remember("best_acc", accuracy)',
+                )
+        return Ty("int")
+
+    def check_recall(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_agent_core(call)
+        bound, _ = self.bind(call, [("key", True), ("default", False)])
+
+        key_node = bound.get("key")
+        if not isinstance(key_node, Literal) or not isinstance(key_node.value, str) or not key_node.value:
+            self.error(
+                "AE0212",
+                'recall requires a quoted key, e.g. recall("best_acc", default: 0.0)',
+                getattr(key_node, "line", call.line),
+                getattr(key_node, "column", call.column),
+                hint='Example: recall("best_acc", default: 0.0)',
+            )
+
+        default_node = bound.get("default")
+        if default_node is not None:
+            ty = self.check_expr(default_node, scope, {})
+            if ty.kind not in ("int", "float"):
+                self.error(
+                    "AE0210",
+                    "recall default must be a number",
+                    getattr(default_node, "line", call.line),
+                    getattr(default_node, "column", call.column),
+                    hint="Example: recall(\"best_acc\", default: 0.0)",
+                )
+        return Ty("float")
+
+    def check_reduction(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        bound, _ = self.bind(call, [("value", True)])
+        node = bound.get("value")
+        if isinstance(node, Name):
+            ty = self.lookup(node, scope)
+            if ty.kind != "tensor":
+                self.error(
+                    "AE0210",
+                    f"{call.name}() reduces a tensor, but '{node.id}' is {self.article(ty.kind)}",
+                    node.line,
+                    node.column,
+                    hint="Allocate one with tensor(rows, cols) -> auto_hardware.",
+                )
+                return ERROR
+        else:
+            self.error(
+                "AE0212",
+                f"{call.name}() takes a tensor variable",
+                getattr(node, "line", call.line),
+                getattr(node, "column", call.column),
+                hint="Example: log mean(results)",
+            )
+            return ERROR
+        return Ty("float")
 
     # ------------------------------------------------------------- fn functions
     def check_fn_call(self, call: Call, scope: dict[str, Ty]) -> Ty:
@@ -1429,7 +1539,8 @@ class Checker:
     def check_let(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
         expr = stmt.expr
         is_fn_call = isinstance(expr, Call) and expr.name in self.functions
-        if not isinstance(expr, (Literal, Binary, Unary, Name)) and not is_fn_call:
+        is_scalar_intent = isinstance(expr, Call) and expr.name in ("recall", "save_json")
+        if not isinstance(expr, (Literal, Binary, Unary, Name)) and not (is_fn_call or is_scalar_intent):
             self.error(
                 "AE0210",
                 f"'let {stmt.name}' binds a scalar; use plain assignment for intent results",

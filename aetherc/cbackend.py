@@ -181,7 +181,7 @@ typedef int ae_socket_t;
 #define AE_CLOSE_SOCKET(s) close(s)
 #endif
 
-#define AE_VERSION "0.5"
+#define AE_VERSION "0.6"
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -1138,6 +1138,130 @@ static double ae_train_accuracy(Model *m, Dataset *d, int epochs, int batch, flo
     return accuracy;
 }
 
+/* -------------------------------------------------------- agent.core memory */
+typedef struct { char key[64]; double value; } AeMem;
+static AeMem ae_mem[256];
+static int ae_mem_count = 0;
+static int ae_mem_loaded = 0;
+
+static void ae_memory_load(const char *path) {
+    ae_mem_count = 0;
+    ae_mem_loaded = 1;
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "rb");
+    if (!handle) return;
+    static char buffer[65536];
+    size_t got = fread(buffer, 1, sizeof(buffer) - 1, handle);
+    fclose(handle);
+    buffer[got] = 0;
+
+    char *cursor = buffer;
+    while (*cursor && ae_mem_count < 256) {
+        char *quote = strchr(cursor, '"');
+        if (!quote) break;
+        char *key_start = quote + 1;
+        char *key_end = strchr(key_start, '"');
+        if (!key_end) break;
+        size_t key_len = (size_t)(key_end - key_start);
+        if (key_len >= 64) key_len = 63;
+        char *colon = strchr(key_end + 1, ':');
+        if (!colon) break;
+        char *value_end = NULL;
+        double value = strtod(colon + 1, &value_end);
+        if (value_end != colon + 1) {
+            AeMem *slot = &ae_mem[ae_mem_count++];
+            memcpy(slot->key, key_start, key_len);
+            slot->key[key_len] = 0;
+            slot->value = value;
+        }
+        cursor = key_end + 1;
+    }
+}
+
+static void ae_memory_save(const char *path) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "wb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot write memory %s\n", resolved);
+        exit(3);
+    }
+    fputs("{\n", handle);
+    for (int i = 0; i < ae_mem_count; i++) {
+        char escaped[160];
+        ae_json_escape(ae_mem[i].key, escaped, sizeof(escaped));
+        fprintf(handle, "  \"%s\": %.17g%s\n", escaped, ae_mem[i].value,
+                i + 1 < ae_mem_count ? "," : "");
+    }
+    fputs("}\n", handle);
+    fclose(handle);
+}
+
+static double ae_memory_recall(const char *key, double default_value, const char *path) {
+    if (!ae_mem_loaded) ae_memory_load(path);
+    double value = default_value;
+    int found = 0;
+    for (int i = 0; i < ae_mem_count; i++) {
+        if (strcmp(ae_mem[i].key, key) == 0) { value = ae_mem[i].value; found = 1; break; }
+    }
+    char escaped[160];
+    ae_json_escape(key, escaped, sizeof(escaped));
+    ae_event("{\"event\":\"recall\",\"key\":\"%s\",\"found\":%s,\"value\":%.17g,\"default\":%.17g,\"backend\":\"c\"}",
+             escaped, found ? "true" : "false", value, default_value);
+    ae_human("  [memory] recalled %s = %.4g (%s)", key, value, found ? "hit" : "default");
+    return value;
+}
+
+static long long ae_memory_remember(const char *key, double value, const char *path) {
+    if (!ae_mem_loaded) ae_memory_load(path);
+    double previous = 0.0;
+    int existed = 0;
+    int slot = -1;
+    for (int i = 0; i < ae_mem_count; i++) {
+        if (strcmp(ae_mem[i].key, key) == 0) { slot = i; existed = 1; previous = ae_mem[i].value; break; }
+    }
+    if (slot < 0 && ae_mem_count < 256) {
+        slot = ae_mem_count++;
+    }
+    if (slot >= 0) {
+        snprintf(ae_mem[slot].key, sizeof(ae_mem[slot].key), "%s", key);
+        ae_mem[slot].value = value;
+    }
+    ae_memory_save(path);
+    char escaped[160];
+    ae_json_escape(key, escaped, sizeof(escaped));
+    ae_event("{\"event\":\"remember\",\"key\":\"%s\",\"value\":%.17g,\"previous\":%.17g,\"existed\":%s,\"backend\":\"c\"}",
+             escaped, value, previous, existed ? "true" : "false");
+    ae_human("  [memory] remembered %s = %.4g%s", key, value,
+             existed ? " (updated)" : "");
+    return 1;
+}
+
+/* ------------------------------------------------------------ reductions */
+static double ae_tensor_sum(const Tensor *t) {
+    double acc = 0.0;
+    const size_t count = (size_t)t->rows * t->cols;
+    #pragma omp parallel for reduction(+:acc) schedule(static)
+    for (long long i = 0; i < (long long)count; i++) acc += t->data[i];
+    ae_event("{\"event\":\"reduce\",\"op\":\"sum\",\"value\":%.17g,\"elements\":%lld,\"backend\":\"c\"}",
+             acc, (long long)count);
+    ae_human("  [sum ]   %.6g | %lld elements", acc, (long long)count);
+    return acc;
+}
+
+static double ae_tensor_mean(const Tensor *t) {
+    double acc = 0.0;
+    const size_t count = (size_t)t->rows * t->cols;
+    #pragma omp parallel for reduction(+:acc) schedule(static)
+    for (long long i = 0; i < (long long)count; i++) acc += t->data[i];
+    double value = count ? acc / (double)count : 0.0;
+    ae_event("{\"event\":\"reduce\",\"op\":\"mean\",\"value\":%.17g,\"elements\":%lld,\"backend\":\"c\"}",
+             value, (long long)count);
+    ae_human("  [mean]   %.6g | %lld elements", value, (long long)count);
+    return value;
+}
+
 /* ------------------------------------------------------------- AEB1 loading */
 static Model ae_model_load(const char *path) {
     char resolved[1200];
@@ -1727,6 +1851,61 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
             )
             return f'ae_save_json_scalar("value", (double)({literal}), "{path}")'
         return 'ae_save_json_scalar("value", 0.0, "")'
+    if node.name == "save_json":
+        bound = _bind(node, ["value", "path"])
+        value = bound.get("value")
+        path_node = bound.get("path")
+        path = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "report.json"
+        )
+        path = _c_string(path.replace("\\", "/"))
+        if isinstance(value, Name):
+            kind, _detail = known.get(value.id, ("value", ""))
+            if kind == "stream":
+                return f'ae_save_json_stream(&{value.id}, "{path}")'
+            if kind == "model":
+                return f'ae_save_json_model(&{value.id}, "{path}")'
+            return f'ae_save_json_scalar("{_c_string(value.id)}", (double)({value.id}), "{path}")'
+        if isinstance(value, Literal):
+            literal = (
+                f'"{_c_string(str(value.value))}"'
+                if isinstance(value.value, str)
+                else str(value.value)
+            )
+            return f'ae_save_json_scalar("value", (double)({literal}), "{path}")'
+        return 'ae_save_json_scalar("value", 0.0, "")'
+    if node.name == "remember":
+        bound = _bind(node, ["key", "value"])
+        key = (
+            bound.get("key").value
+            if isinstance(bound.get("key"), Literal) and isinstance(bound.get("key").value, str)
+            else "key"
+        )
+        return (
+            f'ae_memory_remember("{_c_string(key)}", '
+            f"(double)({_expr_c(bound.get('value'), known, chunks)}), \"{_MEMORY_FILE_C}\")"
+        )
+    if node.name == "recall":
+        bound = _bind(node, ["key", "default"])
+        key = (
+            bound.get("key").value
+            if isinstance(bound.get("key"), Literal) and isinstance(bound.get("key").value, str)
+            else "key"
+        )
+        default = (
+            _expr_c(bound.get("default"), known, chunks) if "default" in bound else "0.0"
+        )
+        return (
+            f'ae_memory_recall("{_c_string(key)}", (double)({default}), "{_MEMORY_FILE_C}")'
+        )
+    if node.name in ("mean", "sum"):
+        bound = _bind(node, ["value"])
+        target = bound.get("value")
+        name = target.id if isinstance(target, Name) else "NULL"
+        reducer = "ae_tensor_mean" if node.name == "mean" else "ae_tensor_sum"
+        return f"{reducer}(&{name})"
     if node.name in _FNS:
         args = [_expr_c(arg.value, known, chunks) for arg in node.args]
         return f"ae_fn_{node.name}({', '.join(args)})"
@@ -1738,6 +1917,7 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
 _WIDTHS: dict[str, int] = {}
 _FNS: set[str] = set()
 _GUARD_ID: list[int] = [0]
+_MEMORY_FILE_C: str = "agent.memory.json"
 
 
 def _known_width(node: object, known: dict[str, tuple[str, str]]) -> int:
@@ -1959,9 +2139,11 @@ def generate_c(
     tasks: list[str] | None = None,
     chunks: int = 8,
 ) -> str:
+    global _MEMORY_FILE_C
     _WIDTHS.clear()
     _FNS.clear()
     _FNS.update(fn.name for fn in program.functions)
+    _MEMORY_FILE_C = _c_string(Path(source_name).stem + ".memory.json")
     source = _json_string(source_name.replace("\\", "/"))
     header = PREAMBLE.replace("__SOURCE__", source)
     out = [header]

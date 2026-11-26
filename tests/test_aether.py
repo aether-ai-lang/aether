@@ -557,6 +557,84 @@ class AetherCliTests(unittest.TestCase):
             payload["diagnostics"],
         )
 
+    # ------------------------------------------------------------------ v0.6
+    def test_agent_memory_python(self) -> None:
+        path = write_temp(
+            "use ai.core\nuse agent.core\n\n"
+            "task Memo:\n"
+            '    let prev = recall("runs", default: 0.0)\n'
+            "    log prev\n"
+            "    remember(\"runs\", prev + 1)\n"
+        )
+        runs = []
+        for _ in range(2):
+            result = run_cli("run", str(path), "--target", "python", "--json")
+            self.assertEqual(result.returncode, 0, result.stdout[-1200:])
+            payload = json.loads(result.stdout)
+            runs.append(self._flow_logs(payload))
+        self.assertEqual(runs[0], ["0"])
+        self.assertEqual(runs[1], ["1"])
+        self.assertTrue((path.parent / "case.memory.json").is_file())
+
+    def test_smart_agent_memory_example(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
+        if find_toolchain() is None:
+            self.skipTest("no C compiler available")
+        memory = ROOT / "examples" / "smart_agent_memory.memory.json"
+        if memory.exists():
+            memory.unlink()
+
+        accuracies = []
+        for _ in range(2):
+            result = run_cli(
+                "run", "examples/smart_agent_memory.ae", "--target", "c", "--json"
+            )
+            self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+            payload = json.loads(result.stdout)
+            events = payload["events"]
+            logs = self._flow_logs(payload)
+            recalls = [e for e in events if e["event"] == "recall"]
+            remembers = [e for e in events if e["event"] == "remember"]
+            self.assertEqual(len(recalls), 1)
+            self.assertEqual(len(remembers), 1)
+            self.assertIn("improved", logs)
+            accuracies.append(remembers[0]["value"])
+            reductions = [e for e in events if e["event"] == "reduce"]
+            self.assertEqual([r["op"] for r in reductions], ["sum", "mean"])
+            self.assertEqual(reductions[0]["elements"], 256)
+        self.assertGreater(accuracies[0], 0.0)
+        self.assertGreater(accuracies[1], accuracies[0], "memory must raise the bar")
+        self.assertTrue(memory.is_file())
+        stored = json.loads(memory.read_text(encoding="utf-8"))
+        self.assertGreater(stored["best_acc"], 0.0)
+
+    def test_memory_and_reduction_contracts(self) -> None:
+        no_agent = write_temp(
+            "use ai.core\n\ntask Forgetful:\n"
+            '    remember("k", 1)\n'
+        )
+        payload = json.loads(run_cli("check", str(no_agent)).stdout)
+        self.assertTrue(
+            any(
+                d["code"] == "AE0200" and "agent.core" in d["message"]
+                for d in payload["diagnostics"]
+            ),
+            payload["diagnostics"],
+        )
+        self.assertIn("use agent.core", payload["fix_patch"])
+
+        bad_reduce = write_temp(
+            "use ai.core\n\ntask Reduce:\n"
+            "    dataset = load_data(samples: 100, features: 8) -> auto_hardware\n"
+            "    log sum(dataset)\n"
+        )
+        payload = json.loads(run_cli("check", str(bad_reduce)).stdout)
+        self.assertTrue(
+            any("reduces a tensor" in d["message"] for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+
     # ------------------------------------------------------------------ v0.3
     def test_serve_requires_web_core_and_route(self) -> None:
         path = write_temp(
@@ -828,7 +906,9 @@ class AetherCliTests(unittest.TestCase):
                 }
             )
             self.assertEqual(init["result"]["serverInfo"]["name"], "aether")
-            self.assertEqual(init["result"]["serverInfo"]["version"], "0.5")
+            from aetherc.diagnostics import AETHER_VERSION
+
+            self.assertEqual(init["result"]["serverInfo"]["version"], AETHER_VERSION)
             notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
             tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

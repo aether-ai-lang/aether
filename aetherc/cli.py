@@ -256,6 +256,20 @@ def make_printer(ui: UI):
             )
         elif kind == "while_guard":
             print(f"  [guard]  {event.get('message', 'loop guard tripped')}")
+        elif kind == "remember":
+            previous = (
+                f" (was {event['previous']:.4g})" if event.get("previous") is not None else ""
+            )
+            print(f"  [memory] remembered {event['key']} = {event['value']:.4g}{previous}")
+        elif kind == "recall":
+            origin = "hit" if event.get("found") else "default"
+            print(
+                f"  [memory] recalled {event['key']} = {event['value']:.4g} ({origin})"
+            )
+        elif kind == "reduce":
+            print(
+                f"  [{event['op']:<4}]   {event['value']:.6g} | {event['elements']:,} elements"
+            )
         elif kind == "save_json":
             print(
                 f"  [json]   {Path(event['path']).name} | {event['bytes']} bytes"
@@ -837,8 +851,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
         description=(
-            "Aether 0.5 - intent-driven AI-agent-native compiler "
-            "(GPU dispatch, data.core, while loops, fn, native C99 + Python backends)"
+            "Aether 0.6 - intent-driven AI-agent-native compiler "
+            "(standalone binary, GPU dispatch, agent memory, tensor reductions)"
         ),
     )
     parser.add_argument(

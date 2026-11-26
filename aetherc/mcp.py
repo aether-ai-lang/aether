@@ -16,6 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from .bootstrap import entry_command, resource
 from .checker import Checker
 from .diagnostics import AETHER_VERSION, apply_patch, merged_fix_patch
 from .lexer import tokenize
@@ -25,7 +26,7 @@ from .cli import analyze, build, error_payload
 ROOT = Path(__file__).resolve().parent.parent
 PROTOCOL_VERSION = "2024-11-05"
 
-SPEC = ROOT / "AETHER_SPEC.md"
+SPEC = resource("AETHER_SPEC.md")
 SERVER_INFO = {"name": "aether", "version": AETHER_VERSION}
 
 
@@ -134,13 +135,7 @@ def tool_run(args: dict) -> dict:
     file = args.get("file")
     if not file:
         return _error_result("missing required argument: file")
-    command = [
-        sys.executable,
-        str(ROOT / "aether.py"),
-        "run",
-        str(file),
-        "--json",
-    ]
+    command = entry_command("run", str(file), "--json")
     if args.get("task"):
         command += ["--task", str(args["task"])]
     if args.get("target"):
@@ -191,15 +186,13 @@ def tool_bench(args: dict) -> dict:
     file = args.get("file")
     if not file:
         return _error_result("missing required argument: file")
-    command = [
-        sys.executable,
-        str(ROOT / "aether.py"),
+    command = entry_command(
         "bench",
         str(file),
         "--json",
         "--repeat",
         str(int(args.get("repeat", 1))),
-    ]
+    )
     try:
         proc = subprocess.run(
             command, capture_output=True, text=True, cwd=str(ROOT), timeout=900

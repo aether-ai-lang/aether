@@ -4,20 +4,19 @@
 
 ### *The First Programming Language Built for AI Agents, Not Human Typists.*
 
-You declare **what** the AI workload is. Aether decides **how** to run it — and emits
-standalone, multi-threaded **C99 machine code**: training jobs, streaming inference,
-native HTTP servers, GPU dispatch, and real CSV→model→JSON pipelines. The language is
-Turing-complete with `while` loops and user functions, and your agent drives
-everything over **MCP**.
+You declare **what** the AI workload is. Aether decides **how** to run it — and ships
+as a **single standalone binary** that compiles your intent to multi-threaded C99
+machine code: training jobs, streaming inference, native HTTP servers, GPU dispatch,
+real CSV→model→JSON pipelines, and **persistent agent memory**. Your agent drives
+everything over **MCP** — and Aether itself no longer needs Python installed.
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
+![standalone](https://img.shields.io/badge/standalone-aether.exe%20%28zero%20Python%29-critical)
 ![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
 ![gpu](https://img.shields.io/badge/GPU-auto%20dispatch%20%28CUDA%20%3E%20C99%20%3E%20Python%29-blueviolet)
 ![turing](https://img.shields.io/badge/language-Turing--complete-blueviolet)
-![blas](https://img.shields.io/badge/BLAS-OpenBLAS%20%7C%20blocked--sgemm-red)
 ![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
-![python](https://img.shields.io/badge/python%20fallback-3.10%2B-informational)
-![tests](https://img.shields.io/badge/tests-33%2F33-brightgreen)
+![tests](https://img.shields.io/badge/tests-36%2F36-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
 **Load real CSV data. Train in a convergence loop. Export model + JSON report.
@@ -50,6 +49,35 @@ task ServeAI:
 </div>
 
 ---
+
+## v0.6 — Zero-Python Standalone + Persistent Agent Memory
+
+```powershell
+python build_standalone.py      # one command, PyInstaller
+dist\aether.exe run hello_aether.ae
+# works with Python REMOVED from PATH — compiler + NumPy + spec all bundled (19 MB)
+```
+
+- **`aether.exe`** — the whole toolchain (compiler, both backends, MCP server, spec)
+  as a single native-launchable binary. Verified: stripped-PATH environment →
+  `.ae` → C99 → machine code → results.
+- **Persistent agent memory (`agent.core`)** —
+  `remember("best_acc", accuracy)` / `let prev = recall("best_acc", default: 0.0)`.
+  State lives in `<program>.memory.json` (plain JSON, identical bytes from the C99
+  and Python backends) so an agent literally remembers its previous run and tries
+  to beat itself. Compiled to native C99 file I/O with a hand-rolled JSON reader.
+- **Tensor reductions** — `sum(results)` / `mean(results)` compile to
+  `#pragma omp parallel for reduction(+:acc)` C loops.
+
+`examples/smart_agent_memory.ae` — the self-improving agent, measured live:
+
+```text
+run 1:  recalled best_acc = 0      (default)  → trained → remembered 0.8333
+run 2:  recalled best_acc = 0.8333 (hit)      → trained → remembered 0.8667
+run 3:  recalled best_acc = 0.8667 (hit)      → trained → remembered 0.9034 ...
+```
+
+Each execution reads its own past, raises the bar, and writes the new best back.
 
 ## v0.5 — GPU Dispatch, Real Data, Guarded Loops
 
@@ -151,9 +179,14 @@ aether bench  |  train_ai_agent.ae  |  task TrainAgent
 git clone https://github.com/aether-ai-lang/aether.git
 cd aether
 
-# compile to a native C binary and run it (falls back to Python/NumPy
-# automatically if no C compiler is installed)
-python aether.py run hello_aether.ae
+# build the standalone binary (one command; or use python aether.py directly)
+python build_standalone.py
+
+# compile to a native C binary and run it — no Python needed afterwards
+dist\aether.exe run hello_aether.ae
+
+# loops, branches, arithmetic, user functions — compiled to C
+dist\aether.exe run examples\control_flow.ae
 
 # loops, branches, arithmetic, user functions — compiled to C
 python aether.py run examples/control_flow.ae
@@ -165,22 +198,23 @@ python aether.py run examples/real_data_pipeline.ae
 python aether.py run examples/autonomous_loop.ae
 
 # validate any .ae file — always JSON, always with a fix_patch when one exists
-python aether.py check hello_aether.ae
+dist\aether.exe check hello_aether.ae
 
 # the headline: Aether vs hand-written Python/NumPy/PyTorch, side by side
-python aether.py bench examples/train_ai_agent.ae
+dist\aether.exe bench examples\train_ai_agent.ae
 ```
 
-That's it. No virtual environment, no pip installs — the Python fallback needs
-only NumPy; the native backend needs any C compiler (gcc/clang/MSVC).
+That's it. The standalone binary needs no Python; building it needs PyInstaller
+(`python -m pip install pyinstaller`), and the Python fallback path needs only
+NumPy. The native backend uses any C compiler (gcc/clang/MSVC).
 
 <details>
 <summary>Optional: put <code>aether</code> on your PATH</summary>
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\bin" | Out-Null
-Copy-Item aether.cmd "$env:USERPROFILE\bin\"
-# then add %USERPROFILE%\bin to PATH and use: aether run hello_aether.ae
+Copy-Item dist\aether.exe "$env:USERPROFILE\bin\aether.exe"
+# then use: aether run hello_aether.ae
 ```
 
 </details>
@@ -359,13 +393,14 @@ language, same diagnostics, same results.
 
 ```
 AETHER_SPEC.md               language specification (grammar, intents, error contract)
-aether.py / aether.cmd       CLI entrypoints
+aether.py / aether.cmd       CLI entrypoints (source mode)
+build_standalone.py          one-command standalone binary builder (dist/)
 aetherc/                     the compiler
   lexer.py parser.py ast_nodes.py    front end (blocks, expressions, functions)
   checker.py diagnostics.py          type rules + fix_patch synthesis + patch application
   gpu.py                             GPU/CUDA probing and target dispatch
   codegen.py                         Python/NumPy backend
-  cbackend.py                        C99 backend: OpenMP, OpenBLAS, HTTP, CSV/JSON I/O
+  cbackend.py                        C99 backend: OpenMP, OpenBLAS, HTTP, CSV/JSON, memory
   runtime.py                         NumPy runtime (devices, training, streaming, serving)
   mcp.py                             MCP server (JSON-RPC over stdio)
   bench.py bench/                    benchmark orchestration + hand-written references
@@ -374,6 +409,7 @@ examples/train_ai_agent.ae   the training demo used by `aether bench`
 examples/serve_ai_api.ae     the 4-line HTTP serving demo
 examples/control_flow.ae     loops, branches, arithmetic, fn, while guards
 examples/real_data_pipeline.ae  CSV -> while convergence -> native JSON report
+examples/smart_agent_memory.ae  persistent memory across executions (v0.6)
 examples/autonomous_loop.ae  self-retraining agent pipeline
 examples/self_heal.ae        intentionally broken file for the healing demo
 examples/data/readings.csv   480-row sample dataset for data.core
@@ -389,18 +425,19 @@ python -m unittest discover -s tests -v
 End-to-end coverage: compile and run on **both** backends, standalone-C emission,
 training + AEB1 export parity, **live HTTP inference against the compiled native
 server and the Python server**, **real CSV ingestion + while convergence + native
-JSON output on both backends**, GPU probe/CUDA fallback behavior, MCP
+JSON output on both backends**, **persistent memory across separate executions
+(native + Python)**, GPU probe/CUDA fallback behavior, MCP
 initialize/tools/fix/compile/spec flows, patch application, control-flow semantics
 (loops, branches, arithmetic, fn, guards) on both backends, JSON contracts, bench
 output, and applying the combined self-heal patch with `git apply`.
 
-## Roadmap (v0.6+)
+## Roadmap (v0.7+)
 
 - Real CUDA training (kernels for SGD backward passes, not just inference)
 - AMD ROCm / OpenCL dispatch tiers behind `auto_hardware`
-- Tensor arithmetic + reductions as intents (`mean`, `sum`, slicing)
+- Tensor arithmetic + slicing; `min`/`max`/`argmax` reductions
 - HTTPS/TLS and streaming (chunked) responses in `web.core`
-- `agent.core` planning intents: memory, tool calls, multi-step reasoning
+- `agent.core` planning intents: tool calls, multi-step reasoning, memory search
 
 ## License
 

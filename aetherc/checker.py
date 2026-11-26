@@ -6,7 +6,7 @@ import difflib
 import re
 from dataclasses import dataclass
 
-from .ast_nodes import Arg, Call, Literal, Modifier, Name, Program, Stmt, Task
+from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary
 from .diagnostics import (
     Diagnostic,
     delete_line_patch,
@@ -15,7 +15,7 @@ from .diagnostics import (
     replace_span_patch,
 )
 
-ALLOWED_MODULES = {"ai.core", "web.core"}
+ALLOWED_MODULES = {"ai.core", "web.core", "agent.core"}
 KNOWN_INTENTS = ("tensor", "load_data", "load_model", "neural_net", "classifier", "run")
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
@@ -23,6 +23,7 @@ MAX_ELEMENTS = 100_000_000
 MAX_SAMPLES = 1_000_000
 MAX_CLASSES = 1_000
 MAX_PORT = 65535
+MAX_REPEAT = 1_000_000
 
 SIGNATURES = {
     "tensor": "tensor(rows, cols) -> auto_hardware",
@@ -64,8 +65,10 @@ class Checker:
         self.uses: set[str] = {u.module for u in program.uses}
         self.core_avail = "ai.core" in self.uses
         self.web_avail = "web.core" in self.uses
+        self.agent_avail = "agent.core" in self.uses
         self.reported_missing_core = False
         self.reported_missing_web = False
+        self.reported_missing_agent = False
 
     # ------------------------------------------------------------------ utils
     def error(
@@ -224,7 +227,39 @@ class Checker:
         for stmt in task.body:
             self.check_stmt(stmt, scope, default_policy)
 
-    def check_stmt(self, stmt: Stmt, scope: dict[str, Ty], default_policy: dict | None) -> None:
+    def check_stmt(
+        self,
+        stmt: Stmt,
+        scope: dict[str, Ty],
+        default_policy: dict | None,
+        inside_block: bool = False,
+    ) -> None:
+        if stmt.kind == "let":
+            self.check_let(stmt, scope)
+            return
+
+        if stmt.kind == "repeat":
+            self.check_repeat(stmt, scope, default_policy)
+            return
+
+        if stmt.kind == "if":
+            self.check_if(stmt, scope, default_policy)
+            return
+
+        if stmt.kind == "log":
+            self.check_log(stmt, scope)
+            return
+
+        if stmt.kind == "serve" and inside_block:
+            self.error(
+                "AE0210",
+                "'serve' must be a top-level task statement",
+                stmt.line,
+                stmt.column,
+                hint="A program serves exactly once; move 'serve' out of loops and conditionals.",
+            )
+            return
+
         if stmt.kind == "train":
             self.check_train(stmt, scope)
             return
@@ -271,6 +306,22 @@ class Checker:
 
     # ------------------------------------------------------------ expressions
     def check_expr(self, expr: object, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
+        if isinstance(expr, Binary):
+            return self.check_binary(expr, scope, default_policy)
+
+        if isinstance(expr, Unary):
+            operand = self.check_expr(expr.operand, scope, default_policy)
+            if operand.kind not in ("int", "float"):
+                self.error(
+                    "AE0210",
+                    "unary '-' requires a number",
+                    expr.line,
+                    expr.column,
+                    hint="Example: let delta = -0.5",
+                )
+                return ERROR
+            return operand
+
         if isinstance(expr, Literal):
             if isinstance(expr.value, bool):
                 return Ty("int")
@@ -290,6 +341,48 @@ class Checker:
 
         self.error("AE0100", "Invalid expression", 1, 1)
         return ERROR
+
+    def check_binary(self, expr: Binary, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
+        left = self.check_expr(expr.left, scope, default_policy)
+        right = self.check_expr(expr.right, scope, default_policy)
+
+        if expr.op in ("==", "!=", ">", "<", ">=", "<="):
+            numeric = ("int", "float")
+            comparable = (
+                left.kind in numeric and right.kind in numeric
+            ) or (left.kind == "str" and right.kind == "str" and expr.op in ("==", "!="))
+            if not comparable:
+                self.error(
+                    "AE0210",
+                    f"cannot compare {self.article(left.kind)} with {self.article(right.kind)}",
+                    expr.line,
+                    expr.column,
+                    hint="Comparisons work on numbers (== != also on strings).",
+                )
+                return ERROR
+            return Ty("bool")
+
+        if left.kind not in ("int", "float") or right.kind not in ("int", "float"):
+            self.error(
+                "AE0210",
+                f"arithmetic requires numbers, got {left.kind} {expr.op} {right.kind}",
+                expr.line,
+                expr.column,
+                hint="Arithmetic works on int/float scalars; tensors and models are not numbers.",
+            )
+            return ERROR
+        if expr.op == "%" and (left.kind != "int" or right.kind != "int"):
+            self.error(
+                "AE0210",
+                "'%' requires two integers",
+                expr.line,
+                expr.column,
+                hint="Example: let phase = count % 2",
+            )
+            return ERROR
+        if expr.op == "/" or left.kind == "float" or right.kind == "float":
+            return Ty("float")
+        return Ty("int")
 
     def lookup(self, name: Name, scope: dict[str, Ty]) -> Ty:
         if name.id in scope:
@@ -344,6 +437,26 @@ class Checker:
             stmt.column,
             hint="Add 'use web.core' above the first task to serve models over HTTP.",
             patch=insert_line_patch(self.path, self.lines, insert_at, "use web.core"),
+        )
+
+    def require_agent_core(self, stmt: Stmt) -> None:
+        if self.agent_avail or self.reported_missing_agent:
+            return
+        self.reported_missing_agent = True
+
+        if self.program.uses:
+            insert_at = max(u.line for u in self.program.uses) + 1
+        elif self.program.tasks:
+            insert_at = self.program.tasks[0].line
+        else:
+            insert_at = 1
+        self.error(
+            "AE0200",
+            "Missing 'use agent.core' for agent loops",
+            stmt.line,
+            stmt.column,
+            hint="Add 'use agent.core' above the first task to use 'repeat ... times:'.",
+            patch=insert_line_patch(self.path, self.lines, insert_at, "use agent.core"),
         )
 
     def check_call(self, call: Call, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
@@ -1003,6 +1116,111 @@ class Checker:
                         route_mod.args[0].column,
                         hint="Keep the route under 128 characters.",
                     )
+
+    # ------------------------------------------------- statements: v0.4 control flow
+    def check_let(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
+        if not isinstance(stmt.expr, (Literal, Binary, Unary, Name)):
+            self.error(
+                "AE0210",
+                f"'let {stmt.name}' binds a scalar; use plain assignment for intent results",
+                stmt.line,
+                stmt.column,
+                hint="Example: let threshold = 0.85   |   data = tensor(64, 64) -> auto_hardware",
+            )
+            return
+
+        ty = self.check_expr(stmt.expr, scope, {})
+        if ty.kind not in ("int", "float", "str", "bool"):
+            self.error(
+                "AE0210",
+                f"'let {stmt.name}' must bind an int, float, string, or bool",
+                stmt.line,
+                stmt.column,
+                hint="Tensors, datasets, and models bind with plain assignment (no 'let').",
+            )
+            return
+
+        previous = scope.get(stmt.name or "")
+        if previous is not None and previous.kind != ty.kind and previous.kind != "error":
+            self.error(
+                "AE0210",
+                f"'{stmt.name}' was {self.article(previous.kind)} and cannot become {self.article(ty.kind)}",
+                stmt.line,
+                stmt.column,
+                hint=f"Keep '{stmt.name}' a {previous.kind}, or use a new name.",
+            )
+            return
+        scope[stmt.name or ""] = ty
+
+    def check_repeat(self, stmt: Stmt, scope: dict[str, Ty], default_policy: dict | None) -> None:
+        self.require_agent_core(stmt)
+
+        count = stmt.count
+        if isinstance(count, Literal):
+            if not isinstance(count.value, int):
+                self.error(
+                    "AE0212",
+                    "repeat count must be an integer",
+                    count.line,
+                    count.column,
+                    hint="Example: repeat 10 times:",
+                )
+            elif not 1 <= count.value <= MAX_REPEAT:
+                self.error(
+                    "AE0212",
+                    f"repeat count must be between 1 and {MAX_REPEAT:,}",
+                    count.line,
+                    count.column,
+                    hint="Split very long runs into stages.",
+                )
+        elif isinstance(count, Name):
+            ty = self.lookup(count, scope)
+            if ty.kind != "int":
+                self.error(
+                    "AE0210",
+                    f"repeat count '{count.id}' must be an int",
+                    count.line,
+                    count.column,
+                    hint="Example: let epochs = 5 ... repeat epochs times:",
+                )
+        else:
+            self.error(
+                "AE0212",
+                "repeat count must be an integer literal or int variable",
+                stmt.line,
+                stmt.column,
+                hint="Example: repeat 10 times:",
+            )
+
+        for inner in stmt.body:
+            self.check_stmt(inner, scope, default_policy, inside_block=True)
+
+    def check_if(self, stmt: Stmt, scope: dict[str, Ty], default_policy: dict | None) -> None:
+        condition = self.check_expr(stmt.expr, scope, default_policy) if stmt.expr else ERROR
+        if condition.kind != "bool":
+            self.error(
+                "AE0210",
+                "if requires a comparison, e.g. confidence > threshold",
+                stmt.line,
+                stmt.column,
+                hint="Example: if accuracy > 0.9:  ...  else:  ...",
+            )
+
+        for inner in stmt.body:
+            self.check_stmt(inner, scope, default_policy, inside_block=True)
+        for inner in stmt.else_body:
+            self.check_stmt(inner, scope, default_policy, inside_block=True)
+
+    def check_log(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
+        ty = self.check_expr(stmt.expr, scope, {})
+        if ty.kind not in ("int", "float", "str", "bool"):
+            self.error(
+                "AE0210",
+                f"cannot log {self.article(ty.kind)}",
+                stmt.line,
+                stmt.column,
+                hint="log takes strings and numbers: log \"done\" or log total.",
+            )
 
     # -------------------------------------------------------- statement: export
     def check_export(self, stmt: Stmt, scope: dict[str, Ty]) -> None:

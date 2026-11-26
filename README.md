@@ -6,15 +6,16 @@
 
 You declare **what** the AI workload is. Aether decides **how** to run it — and emits
 standalone, multi-threaded **C99 machine code**: training jobs, streaming inference,
-and now **native HTTP/JSON model servers**. Zero Python at runtime. Your agent drives
-the whole toolchain over **MCP**.
+native HTTP/JSON model servers, and — as of v0.4 — **real control flow**. The
+language is now Turing-complete, and your agent drives everything over **MCP**.
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
+![turing](https://img.shields.io/badge/language-Turing--complete%20%28v0.4%29-blueviolet)
 ![blas](https://img.shields.io/badge/BLAS-OpenBLAS%20%7C%20blocked--sgemm-red)
 ![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
 ![python](https://img.shields.io/badge/python%20fallback-3.10%2B-informational)
-![tests](https://img.shields.io/badge/tests-25%2F25-brightgreen)
+![tests](https://img.shields.io/badge/tests-30%2F30-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
 **Train a classifier. Export the weights. Serve them as a JSON API. Four lines.**
@@ -32,17 +33,37 @@ task ServeAI:
 
 ---
 
-## v0.3 — Full-Stack Aether
+## v0.4 — Turing-Complete Aether
 
-v0.2 proved agents can *train* models in 7 lines. v0.3 lets them **ship** them:
+v0.3 let agents *train and ship* models. v0.4 lets them **program**:
 
-- **`web.core` / `serve` intent** — `aether run examples/serve_ai_api.ae` compiles to a
-  standalone **native C99 HTTP/JSON inference server** (Winsock2 on Windows, POSIX
-  sockets elsewhere, one thread per connection). The Python backend serves the
-  identical API via the standard library. Same 4 lines, same endpoints.
-- **`load_model("model.ae.bin")`** — load an exported **AEB1** model into any task.
-- **`aether mcp`** — a native **Model Context Protocol** server (JSON-RPC 2.0 over
-  stdio) exposing check / fix / compile / run / spec / bench to AI coding agents.
+- **Scalars & arithmetic** — `let threshold = 0.85`, `let total = total + 2`, unary
+  minus, `+ - * / %` with C-style precedence. `/` is true division on both backends.
+- **Loops** — `repeat 10 times:` (integer literal or int variable), gated on
+  **`agent.core`**: loops are how agents act autonomously.
+- **Branches** — `if confidence > threshold:` / `else:` with full comparisons
+  (`== != > < >= <=`).
+- **`log "..."`** — structured output your agent can read from the run payload.
+- Everything compiles to the **same native C99** — loops and branches are plain C
+  `for`/`if` in the generated binary; the Python backend gets idiomatic `for`/`if`.
+
+An autonomous retraining pipeline in 8 lines (`examples/autonomous_loop.ae`):
+
+```aether
+use ai.core
+use agent.core
+
+task AutonomousPipeline:
+    dataset = load_data(samples: 5000, features: 64, classes: 5) -> auto_hardware
+    model = classifier(in: 64, classes: 5) -> optimize(speed: max)
+    repeat 3 times:
+        train model on dataset(epochs: 2) -> self_heal
+    export model -> "v04_agent.ae.bin"
+```
+
+Each loop iteration trains with self-healing and keeps the weights — measured live
+on the native binary: accuracy climbs **0.844 → 0.896 → 0.941** across iterations,
+then the trained agent exports itself.
 
 ## Live native inference
 
@@ -86,12 +107,18 @@ aether bench  |  train_ai_agent.ae  |  task TrainAgent
 ## 30-Second Quickstart
 
 ```powershell
-git clone https://github.com/ermiyas/aether.git
+git clone https://github.com/aether-ai-lang/aether.git
 cd aether
 
 # compile to a native C binary and run it (falls back to Python/NumPy
 # automatically if no C compiler is installed)
 python aether.py run hello_aether.ae
+
+# loops, branches, arithmetic — compiled to C
+python aether.py run examples/control_flow.ae
+
+# an autonomous agent that retrains itself in a loop
+python aether.py run examples/autonomous_loop.ae
 
 # validate any .ae file — always JSON, always with a fix_patch when one exists
 python aether.py check hello_aether.ae
@@ -167,7 +194,8 @@ Aether is built around three ideas:
    human-readable hint, and a `fix_patch` unified diff. Apply, re-check, continue —
    no model round-trip wasted on re-reading the whole file.
 3. **The runtime is a machine-code artifact.** `aether run` emits C, compiles it,
-   and executes the binary. Agents don't ship an interpreter; they ship a plan.
+   and executes the binary. Agents don't ship an interpreter; they ship a plan —
+   and since v0.4 that plan can loop, branch, and do arithmetic.
 
 ## MCP: agents driving Aether natively
 
@@ -300,8 +328,10 @@ aetherc/                     the compiler
 hello_aether.ae              5-line inference demo
 examples/train_ai_agent.ae   the training demo used by `aether bench`
 examples/serve_ai_api.ae     the 4-line HTTP serving demo
+examples/control_flow.ae     loops, branches, arithmetic on both backends
+examples/autonomous_loop.ae  self-retraining agent pipeline (v0.4)
 examples/self_heal.ae        intentionally broken file for the healing demo
-tests/test_aether.py         end-to-end tests (both backends, HTTP, MCP)
+tests/test_aether.py         end-to-end tests (both backends, HTTP, MCP, control flow)
 ```
 
 ## Tests
@@ -313,15 +343,16 @@ python -m unittest discover -s tests -v
 End-to-end coverage: compile and run on **both** backends, standalone-C emission,
 training + AEB1 export parity, **live HTTP inference against the compiled native
 server and the Python server**, MCP initialize/tools/fix/compile/spec flows, patch
-application, classifier diagnostics with patches, JSON contracts, bench output, and
-applying the combined self-heal patch with `git apply`.
+application, control-flow semantics (loops, branches, arithmetic) on both backends,
+JSON contracts, bench output, and applying the combined self-heal patch with
+`git apply`.
 
-## Roadmap (v0.4+)
+## Roadmap (v0.5+)
 
-- Loops, conditionals, and arithmetic over tensors in the intent graph
+- `while` loops and comparisons over tensors (tensor reductions as intents)
 - GPU backend behind `auto_hardware` (the binding is already the language contract)
 - HTTPS/TLS and streaming (chunked) responses in `web.core`
-- Importable intent packs beyond `ai.core` / `web.core`
+- More intent packs (`agent.core`: memory, tools, planning intents)
 - Deterministic cross-backend parity tests (bit-identical digests)
 
 ## License

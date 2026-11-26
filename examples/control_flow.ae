@@ -1,0 +1,12 @@
+﻿use ai.core
+use agent.core
+
+task Flow:
+    let total = 0
+    repeat 5 times:
+        let total = total + 2
+    if total > 8:
+        log "big"
+    else:
+        log "small"
+    log total

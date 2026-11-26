@@ -350,6 +350,88 @@ class AetherCliTests(unittest.TestCase):
         self.assertEqual(workload.hidden, 128)
         self.assertEqual(workload.epochs, 5)
 
+    # ------------------------------------------------------------------ v0.4
+    @staticmethod
+    def _flow_logs(payload: dict) -> list[str]:
+        return [
+            event.get("text", "")
+            for event in payload["events"]
+            if event["event"] == "log"
+        ]
+
+    def test_control_flow_python(self) -> None:
+        result = run_cli("run", "examples/control_flow.ae", "--target", "python", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["target"], "python")
+        self.assertEqual(self._flow_logs(payload), ["big", "10"])
+
+    def test_control_flow_native(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
+        if find_toolchain() is None:
+            self.skipTest("no C compiler available")
+        result = run_cli("run", "examples/control_flow.ae", "--target", "c", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["target"], "c")
+        self.assertEqual(self._flow_logs(payload), ["big", "10"])
+
+    def test_autonomous_loop_runs(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
+        if find_toolchain() is None:
+            self.skipTest("no C compiler available")
+        result = run_cli("run", "examples/autonomous_loop.ae", "--target", "c", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        trainings = [
+            event for event in payload["events"] if event["event"] == "train_done"
+        ]
+        self.assertEqual(len(trainings), 3, "repeat 3 times must train three times")
+        self.assertEqual(trainings[0]["epochs"], 2)
+        self.assertGreater(trainings[-1]["accuracy"], 0.8)
+        exports = [event for event in payload["events"] if event["event"] == "export"]
+        self.assertTrue(exports)
+        self.assertIn("v04_agent.ae.bin", exports[0]["path"])
+
+    def test_repeat_requires_agent_core(self) -> None:
+        path = write_temp(
+            "use ai.core\n"
+            "\n"
+            "task Loopy:\n"
+            "    repeat 3 times:\n"
+            "        log \"tick\"\n"
+        )
+        payload = json.loads(run_cli("check", str(path)).stdout)
+        self.assertEqual(payload["status"], "error")
+        self.assertTrue(
+            any(
+                d["code"] == "AE0200" and "agent.core" in d["message"]
+                for d in payload["diagnostics"]
+            ),
+            payload["diagnostics"],
+        )
+        self.assertIn("use agent.core", payload["fix_patch"])
+
+    def test_control_flow_type_rules(self) -> None:
+        cases = [
+            ('    let bad = "a" + 1', "arithmetic requires numbers"),
+            ('    let flag = 1\n    if flag:\n        log "x"', "if requires a comparison"),
+            ("    let n = 0\n    let n = 0.5", "cannot become"),
+            ("    let m = 5 % 2.0", "'%' requires two integers"),
+        ]
+        for body, expected in cases:
+            path = write_temp(
+                "use ai.core\nuse agent.core\n\ntask Typed:\n" + body + "\n"
+            )
+            payload = json.loads(run_cli("check", str(path)).stdout)
+            self.assertEqual(payload["status"], "error", body)
+            self.assertTrue(
+                any(expected in d["message"] for d in payload["diagnostics"]),
+                (body, payload["diagnostics"]),
+            )
+
     # ------------------------------------------------------------------ v0.3
     def test_serve_requires_web_core_and_route(self) -> None:
         path = write_temp(
@@ -621,7 +703,7 @@ class AetherCliTests(unittest.TestCase):
                 }
             )
             self.assertEqual(init["result"]["serverInfo"]["name"], "aether")
-            self.assertEqual(init["result"]["serverInfo"]["version"], "0.3")
+            self.assertEqual(init["result"]["serverInfo"]["version"], "0.4")
             notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
             tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

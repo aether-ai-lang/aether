@@ -1,12 +1,14 @@
-# Aether (.ae) — Language Specification v0.3
+# Aether (.ae) — Language Specification v0.4
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
 training run, a stream, an HTTP endpoint); the compiler decides *how* (device, dtype,
-fusion, buffering, threading, even the BLAS thread pool). v0.3 compiles the same
-intent graph to **standalone, multi-threaded C** (`--target=c`, the default when a C
-compiler is present — zero Python at runtime) or to optimized NumPy/OpenBLAS Python,
-and can serve trained models over HTTP as a **native C99 JSON API**. The `aether mcp`
-command exposes the whole toolchain to AI agents over the Model Context Protocol.
+fusion, buffering, threading, even the BLAS thread pool). v0.4 makes the language
+**Turing-complete**: scalars, arithmetic, comparisons, `repeat` loops, and `if/else`
+branches compile to the same **standalone, multi-threaded C** (`--target=c`, the
+default when a C compiler is present — zero Python at runtime) or to optimized
+NumPy/OpenBLAS Python. Trained models can be served over HTTP as a **native C99
+JSON API**, and `aether mcp` exposes the whole toolchain to AI agents over the
+Model Context Protocol.
 
 ## 1. Lexical rules
 
@@ -15,6 +17,7 @@ command exposes the whole toolchain to AI agents over the Model Context Protocol
 - Comments start with `#` and run to end of line.
 - Identifiers: `[A-Za-z_][A-Za-z0-9_]*`. Task names are PascalCase by convention.
 - Numbers: integer (`1024`) or decimal (`0.5`). Strings: `"..."` or `'...'`.
+- Operators: arithmetic `+ - * / %`, comparison `== != > < >= <=`, unary `-`.
 
 ## 2. Grammar (EBNF)
 
@@ -23,13 +26,23 @@ program     := { use_decl | task_decl }
 use_decl    := "use" IDENT { "." IDENT } NEWLINE
 task_decl   := "task" IDENT [ "->" modifier ] ":" NEWLINE INDENT { stmt } DEDENT
 stmt        := IDENT "=" expr NEWLINE
+             | "let" IDENT "=" expr NEWLINE
+             | "repeat" ( NUMBER | IDENT ) "times" ":" NEWLINE INDENT { stmt } DEDENT
+             | "if" expr ":" NEWLINE INDENT { stmt } DEDENT
+               [ "else" ":" NEWLINE INDENT { stmt } DEDENT ]
+             | "log" expr NEWLINE
              | "train" IDENT "on" IDENT "(" "epochs" ":" NUMBER ")" { "->" modifier } NEWLINE
              | "export" IDENT "->" STRING NEWLINE
              | "serve" IDENT "on" "port" "(" NUMBER ")" { "->" modifier } NEWLINE
              | "emit" expr NEWLINE
              | "return" expr NEWLINE
              | expr NEWLINE
-expr        := call { "->" modifier }
+expr        := comparison { "->" modifier }
+comparison  := additive [ ("=="|"!="|">"|"<"|">="|"<=") additive ]
+additive    := term { ("+"|"-") term }
+term        := unary { ("*"|"/"|"%") unary }
+unary       := "-" unary | primary
+primary     := NUMBER | STRING | IDENT | call | "(" comparison ")"
 call        := IDENT "(" [ args ] ")"
              | "run" IDENT "(" [ arg ] ")"
 args        := arg { "," arg }
@@ -40,17 +53,19 @@ modifier    := IDENT [ "(" [ args ] ")" ]
 
 `run` is a special form: it takes a **model variable**, then the input tensor or
 dataset. `serve` is a blocking statement: the program becomes an HTTP server until
-interrupted. Modifiers chain with `->`; at most one of each kind is meaningful.
+interrupted (it may only appear as a top-level task statement). Modifiers chain with
+`->`; at most one of each kind is meaningful.
 
 ## 3. Declarations
 
 ```
 use ai.core
 use web.core
+use agent.core
 ```
-`ai.core` is required before any AI intent. `web.core` is required before `serve`
-(omitting it is `AE0200` with a fix patch that inserts the line). `use` lines must
-come before tasks.
+`ai.core` is required before any AI intent. `web.core` is required before `serve`;
+`agent.core` is required before `repeat` loops (autonomy). Omitting any of them is
+`AE0200` with a fix patch that inserts the line. `use` lines must come before tasks.
 
 ```
 task <Name>:
@@ -140,15 +155,31 @@ raw little-endian f32 `W1, b1, W2, b2`. Classifiers must be trained first
 (`AE0210`). Relative paths resolve against the source file's directory. The same
 format is produced by the C and Python backends.
 
+### Control flow and scalars (v0.4)
+
+| Statement | Semantics |
+|---|---|
+| `let name = expr` | binds a scalar (`int`, `float`, `str`, or `bool`). Types are stable: rebinding with a different type is `AE0210`. Tensors/datasets/models bind with plain assignment. |
+| `repeat N times:` | runs the indented body `N` times; `N` is an integer literal (1..1,000,000) or an int variable. Requires `agent.core`. |
+| `if cond:` / `else:` | runs the first branch whose comparison holds. `cond` must be a comparison (`AE0210` otherwise); `else` is optional. |
+| `log expr` | emits a `log` event with the string or number. |
+
+Operators: `+ - * / %` (with unary `-`) and comparisons `== != > < >= <=`.
+Precedence: `%` and `*` `/` bind tighter than `+` `-`, which bind tighter than
+comparisons; parentheses group. `/` is **true division** on both backends (C is
+emitted with explicit double casts); `%` is integer-only. Arithmetic requires
+numeric scalars — tensors, datasets, and models are not numbers (`AE0210`).
+
 ### `emit` and `return`
 `emit <value>` prints a summary of a tensor, dataset, stream result, number, or
 string. `return <value>` ends the task and yields the value to the host.
 
 ## 5. Types
 
-`tensor`, `dataset`, `model`, `stream`, `int`, `float`, `str`. v0.2 has no
-arithmetic, conditionals, loops, or user-defined functions. Invalid operations are
-compile-time errors (`AE0210`), never silent coercions.
+`tensor`, `dataset`, `model`, `stream`, `int`, `float`, `str`, `bool`. Loops and
+conditionals make the language Turing-complete; there are still no user-defined
+functions. Invalid operations are compile-time errors (`AE0210`), never silent
+coercions.
 
 ## 6. Examples
 
@@ -187,6 +218,21 @@ use web.core
 task ServeAI:
     model = load_model("model.ae.bin") -> auto_hardware
     serve model on port(8080) -> route("/predict")
+```
+
+An autonomous agent pipeline — loops retrain with self-healing until the
+controller is satisfied (v0.4):
+
+```aether
+use ai.core
+use agent.core
+
+task AutonomousPipeline:
+    dataset = load_data(samples: 5000, features: 64, classes: 5) -> auto_hardware
+    model = classifier(in: 64, classes: 5) -> optimize(speed: max)
+    repeat 3 times:
+        train model on dataset(epochs: 2) -> self_heal
+    export model -> "v04_agent.ae.bin"
 ```
 
 ## 7. Backends and the CLI
@@ -272,9 +318,10 @@ toolchain missing, `AE0000` unreadable/missing file, `AE9999` internal compiler 
    `train model on dataset(epochs: N) -> self_heal`,
    `export model -> "model.ae.bin"`,
    `run model(data) -> stream_output`.
-3. Dimensions, epochs, and ports are integer literals; export paths and routes are
-   string literals; routes must start with `/`.
+3. Dimensions, epochs, repeat counts, and ports are integer literals (repeat also
+   takes an int variable); export paths and routes are string literals; routes must
+   start with `/`.
 4. Define every variable before use; `train` before `export`; `serve` is last — it
-   blocks. Tasks are straight-line.
+   blocks and must be top-level. `let` scalars keep one type for their whole life.
 5. Run `aether check file.ae`; if `status == "error"`, apply `fix_patch` and re-check
    (or call the `aether_fix` MCP tool, which does both in one step).

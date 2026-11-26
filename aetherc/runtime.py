@@ -945,6 +945,14 @@ class Runtime:
             server.server_close()
             self._emit_event("serve_stop", port=port, backend="python")
 
+    # ------------------------------------------------------------------- logs
+    def log(self, value: object) -> None:
+        if isinstance(value, float):
+            text = f"{value:.6g}"
+        else:
+            text = str(value)
+        self._emit_event("log", text=text)
+
     # ------------------------------------------------------------------ emit
     def emit(self, value: object) -> None:
         if isinstance(value, Tensor):

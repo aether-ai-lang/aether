@@ -292,6 +292,8 @@ def make_printer(ui: UI):
             )
         elif kind == "print":
             print(f"  [emit]   {event['text']}")
+        elif kind == "log":
+            print(f"  [log]    {event['text']}")
         elif kind == "emit_tensor":
             print(
                 f"  [emit]   tensor[{event['rows']}x{event['cols']}] mean={event['mean']:+.4f} "
@@ -691,8 +693,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
         description=(
-            "Aether 0.3 - intent-driven AI-agent-native compiler "
-            "(native C99 + Python backends, HTTP serving, MCP server)"
+            "Aether 0.4 - intent-driven AI-agent-native compiler "
+            "(Turing-complete, native C99 + Python backends, HTTP serving, MCP)"
         ),
     )
     parser.add_argument(

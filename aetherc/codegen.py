@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ast_nodes import Arg, Call, Literal, Modifier, Name, Program, Stmt, Task
+from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary
 from .diagnostics import AETHER_VERSION
 
 
@@ -57,6 +57,19 @@ def _stmt_comment(stmt: Stmt, source_lines: list[str]) -> str:
 
 
 def _expr_src(call: object, task_policy: dict | None) -> str:
+    if isinstance(call, Binary):
+        op = call.op
+        left = _expr_src(call.left, task_policy)
+        right = _expr_src(call.right, task_policy)
+        if op == "%":
+            return f"({left} % {right})"
+        if op in ("==", "!=", ">", "<", ">=", "<="):
+            return f"({left} {op} {right})"
+        if op == "/":
+            return f"({left} / {right})"
+        return f"({left} {op} {right})"
+    if isinstance(call, Unary):
+        return f"(-{_expr_src(call.operand, task_policy)})"
     if isinstance(call, Literal):
         return repr(call.value)
     if isinstance(call, Name):
@@ -126,18 +139,39 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
     return f"rt.unsupported({call.name!r})"
 
 
-def _stmt_src(stmt: Stmt, task_policy: dict | None, source_lines: list[str]) -> list[str]:
-    rendered: list[str] = []
-    if stmt.kind == "assign":
-        rendered.append(f"{stmt.name} = {_expr_src(stmt.expr, task_policy)}")
+def _stmt_src(
+    stmt: Stmt, task_policy: dict | None, source_lines: list[str], depth: int = 0
+) -> list[str]:
+    """Render one statement; every returned line is fully indented."""
+    pad = "    " * (2 + depth)
+    out: list[str] = [pad + _stmt_comment(stmt, source_lines)]
+
+    def render_inner(body: list[Stmt], extra_depth: int) -> list[str]:
+        lines: list[str] = []
+        for inner in body:
+            lines.extend(_stmt_src(inner, task_policy, source_lines, depth + extra_depth))
+        return lines or [pad + "    pass"]
+
+    if stmt.kind in ("assign", "let"):
+        out.append(pad + f"{stmt.name} = {_expr_src(stmt.expr, task_policy)}")
+    elif stmt.kind == "repeat":
+        out.append(pad + f"for _ae_loop in range(int({_expr_src(stmt.count, task_policy)})):")
+        out.extend(render_inner(stmt.body, 1))
+    elif stmt.kind == "if":
+        out.append(pad + f"if {_expr_src(stmt.expr, task_policy)}:")
+        out.extend(render_inner(stmt.body, 1))
+        out.append(pad + "else:")
+        out.extend(render_inner(stmt.else_body, 1))
+    elif stmt.kind == "log":
+        out.append(pad + f"rt.log({_expr_src(stmt.expr, task_policy)})")
     elif stmt.kind == "emit":
-        rendered.append(f"rt.emit({_expr_src(stmt.expr, task_policy)})")
+        out.append(pad + f"rt.emit({_expr_src(stmt.expr, task_policy)})")
     elif stmt.kind == "return":
-        rendered.append(f"return {_expr_src(stmt.expr, task_policy)}")
+        out.append(pad + f"return {_expr_src(stmt.expr, task_policy)}")
     elif stmt.kind == "train":
-        rendered.append(f"rt.train({stmt.target}, {stmt.data}, epochs={stmt.epochs})")
+        out.append(pad + f"rt.train({stmt.target}, {stmt.data}, epochs={stmt.epochs})")
     elif stmt.kind == "export":
-        rendered.append(f"rt.export({stmt.target}, {stmt.path!r})")
+        out.append(pad + f"rt.export({stmt.target}, {stmt.path!r})")
     elif stmt.kind == "serve":
         route = "/predict"
         for mod in stmt.modifiers:
@@ -146,11 +180,11 @@ def _stmt_src(stmt: Stmt, task_policy: dict | None, source_lines: list[str]) -> 
                 if isinstance(value, Literal) and isinstance(value.value, str):
                     route = value.value
                     break
-        rendered.append(f"rt.serve({stmt.target}, port={stmt.port}, route={route!r})")
+        out.append(pad + f"rt.serve({stmt.target}, port={stmt.port}, route={route!r})")
     else:
-        rendered.append(_expr_src(stmt.expr, task_policy))
+        out.append(pad + _expr_src(stmt.expr, task_policy))
 
-    return [_stmt_comment(stmt, source_lines)] + rendered
+    return out
 
 
 def _task_function(task: Task, source_lines: list[str]) -> list[str]:
@@ -158,8 +192,7 @@ def _task_function(task: Task, source_lines: list[str]) -> list[str]:
     lines = [f"    def task_{task.name}(rt):"]
     body: list[str] = []
     for stmt in task.body:
-        for source in _stmt_src(stmt, policy, source_lines):
-            body.append(f"        {source}")
+        body.extend(_stmt_src(stmt, policy, source_lines))
     if not body:
         body.append("        return None")
     return lines + body

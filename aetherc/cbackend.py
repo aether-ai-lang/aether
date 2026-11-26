@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .ast_nodes import Call, Literal, Name, Program, Stmt, Task
+from .ast_nodes import Binary, Call, Literal, Name, Program, Stmt, Task, Unary
 
 AETHER_C_VERSION = "1"
 
@@ -181,7 +181,7 @@ typedef int ae_socket_t;
 #define AE_CLOSE_SOCKET(s) close(s)
 #endif
 
-#define AE_VERSION "0.3"
+#define AE_VERSION "0.4"
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -901,6 +901,11 @@ static void ae_emit_text(const char *text) {
     ae_human("  [emit]   %s", text);
 }
 
+static void ae_log_text(const char *text) {
+    ae_event("{\"event\":\"log\",\"text\":\"%s\",\"backend\":\"c\"}", text);
+    ae_human("  [log]    %s", text);
+}
+
 static void ae_emit_tensor(const Tensor *t) {
     double sum = 0.0, square_sum = 0.0, peak = 0.0;
     size_t count = (size_t)t->rows * t->cols;
@@ -1350,10 +1355,19 @@ def _policy_speed(task: Task, call: Call | None = None) -> str:
     return "balanced"
 
 
+def _iter_statements(body: list[Stmt]):
+    for stmt in body:
+        yield stmt
+        if stmt.body:
+            yield from _iter_statements(stmt.body)
+        if stmt.else_body:
+            yield from _iter_statements(stmt.else_body)
+
+
 def _types(task: Task) -> dict[str, tuple[str, str]]:
     """Map variable -> (kind, detail) where detail is 'model:classifier' etc."""
     known: dict[str, tuple[str, str]] = {}
-    for stmt in task.body:
+    for stmt in _iter_statements(task.body):
         if stmt.kind != "assign" or not isinstance(stmt.expr, Call):
             continue
         call = stmt.expr
@@ -1372,6 +1386,26 @@ def _types(task: Task) -> dict[str, tuple[str, str]]:
     return known
 
 
+def _scalar_c_type(expr: object, strings: set[str]) -> str:
+    if isinstance(expr, Literal) and isinstance(expr.value, str):
+        return "const char *"
+    if isinstance(expr, Literal) and isinstance(expr.value, bool):
+        return "int"
+    if isinstance(expr, Literal) and isinstance(expr.value, int):
+        return "long long"
+    if isinstance(expr, Binary):
+        if expr.op in ("==", "!=", ">", "<", ">=", "<="):
+            return "int"
+        if expr.op == "%":
+            return "long long"
+        if isinstance(expr.left, Literal) and isinstance(expr.left.value, str):
+            return "const char *"
+        return "double"
+    if isinstance(expr, Name):
+        return "double"
+    return "double"
+
+
 def _run_expr(call: Call, known: dict[str, tuple[str, str]], chunks: int) -> str:
     bound = _bind(call, ["data"])
     data = bound.get("data")
@@ -1385,11 +1419,22 @@ def _run_expr(call: Call, known: dict[str, tuple[str, str]], chunks: int) -> str
 
 
 def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str:
+    if isinstance(node, Binary):
+        left = _expr_c(node.left, known, chunks)
+        right = _expr_c(node.right, known, chunks)
+        if node.op == "%":
+            return f"((long long)({left}) % (long long)({right}))"
+        if node.op == "/":
+            # Aether '/' is true division on both backends.
+            return f"((double)({left}) / (double)({right}))"
+        return f"(({left}) {node.op} ({right}))"
+    if isinstance(node, Unary):
+        return f"(-{_expr_c(node.operand, known, chunks)})"
     if isinstance(node, Literal):
         if isinstance(node.value, str):
             return f'"{_c_string(node.value)}"'
         if isinstance(node.value, float):
-            return f"{node.value!r}f"
+            return repr(node.value)
         return str(node.value)
     if isinstance(node, Name):
         return node.id
@@ -1441,10 +1486,23 @@ def _known_width(node: object, known: dict[str, tuple[str, str]]) -> int:
     return 0
 
 
+def _collect_scalars(body: list[Stmt], decls: dict[str, str], strings: set[str]) -> None:
+    """Pre-declare every `let` scalar at function scope (C needs declarations)."""
+    for stmt in _iter_statements(body):
+        if stmt.kind != "let" or not stmt.name:
+            continue
+        if stmt.name in decls:
+            continue
+        ctype = _scalar_c_type(stmt.expr, strings)
+        decls[stmt.name] = ctype
+        if ctype.startswith("const char"):
+            strings.add(stmt.name)
+
+
 def _task_c(task: Task, chunks: int) -> list[str]:
     _WIDTHS.clear()
     known = _types(task)
-    for stmt in task.body:
+    for stmt in _iter_statements(task.body):
         if stmt.kind == "assign" and isinstance(stmt.expr, Call):
             call = stmt.expr
             if call.name == "tensor":
@@ -1462,14 +1520,21 @@ def _task_c(task: Task, chunks: int) -> list[str]:
                 )
                 _WIDTHS[stmt.name or ""] = width
 
+    decls: dict[str, str] = {}
+    strings: set[str] = set()
+    _collect_scalars(task.body, decls, strings)
+
     name = task.name
     lines = [
         f"static void task_{name}(void) {{",
         "    double task_started = ae_now_ms();",
     ]
+    for scalar, ctype in decls.items():
+        initializer = '""' if ctype.startswith("const char") else ("0.0" if ctype == "double" else "0")
+        lines.append(f"    {ctype} {scalar} = {initializer};")
     for stmt in task.body:
-        lines.extend(_stmt_c(stmt, known, chunks))
-    if len(lines) == 2:
+        lines.extend(_stmt_c(stmt, known, chunks, depth=0, strings=strings))
+    if len(lines) == 2 + len(decls):
         lines.append("    (void)0;")
     lines.extend(
         [
@@ -1485,15 +1550,62 @@ def _task_c(task: Task, chunks: int) -> list[str]:
 
 
 def _stmt_c(
-    stmt: Stmt, known: dict[str, tuple[str, str]], chunks: int
+    stmt: Stmt,
+    known: dict[str, tuple[str, str]],
+    chunks: int,
+    depth: int = 0,
+    strings: set[str] | None = None,
 ) -> list[str]:
+    strings = strings or set()
+    pad = "    " * (depth + 1)
+
+    def render_inner(body: list[Stmt]) -> list[str]:
+        lines: list[str] = []
+        for inner in body:
+            lines.extend(
+                _stmt_c(inner, known, chunks, depth=depth + 1, strings=strings)
+            )
+        return lines or [pad + "    ;"]
+
     if stmt.kind == "assign":
         value = _expr_c(stmt.expr, known, chunks)
-        kind, detail = known.get(stmt.name or "", ("value", ""))
-        c_type = {"tensor": "Tensor", "dataset": "Dataset", "model": "Model", "stream": "StreamResult"}.get(
-            kind, "double"
-        )
-        return [f"    {c_type} {stmt.name} = {value};"]
+        kind, _detail = known.get(stmt.name or "", ("value", ""))
+        c_type = {
+            "tensor": "Tensor",
+            "dataset": "Dataset",
+            "model": "Model",
+            "stream": "StreamResult",
+        }.get(kind, "double")
+        return [f"{pad}{c_type} {stmt.name} = {value};"]
+
+    if stmt.kind == "let":
+        return [f"{pad}{stmt.name} = {_expr_c(stmt.expr, known, chunks)};"]
+
+    if stmt.kind == "repeat":
+        count = _expr_c(stmt.count, known, chunks)
+        lines = [f"{pad}for (long long ae_i{depth} = 0; ae_i{depth} < (long long)({count}); ae_i{depth}++) {{"]
+        lines.extend(render_inner(stmt.body))
+        lines.append(f"{pad}}}")
+        return lines
+
+    if stmt.kind == "if":
+        condition = _expr_c(stmt.expr, known, chunks)
+        lines = [f"{pad}if ({condition}) {{"]
+        lines.extend(render_inner(stmt.body))
+        lines.append(f"{pad}}} else {{")
+        lines.extend(render_inner(stmt.else_body))
+        lines.append(f"{pad}}}")
+        return lines
+
+    if stmt.kind == "log":
+        expr = stmt.expr
+        if isinstance(expr, Literal) and isinstance(expr.value, str):
+            return [f'{pad}ae_log_text("{_c_string(expr.value)}");']
+        if isinstance(expr, Name) and expr.id in strings:
+            return [f'{pad}ae_log_text((const char *)({expr.id} ? {expr.id} : ""));']
+        return [
+            f"{pad}{{ char ae_buf{depth}[256]; snprintf(ae_buf{depth}, sizeof(ae_buf{depth}), \"%.6g\", (double)({_expr_c(expr, known, chunks)})); ae_log_text(ae_buf{depth}); }}"
+        ]
 
     if stmt.kind == "emit":
         expr = stmt.expr
@@ -1504,26 +1616,26 @@ def _stmt_c(
                 "stream": "ae_emit_stream",
             }.get(kind)
             if emitter:
-                return [f"    {emitter}(&{expr.id});" if kind == "tensor" else f"    {emitter}({expr.id});"]
-            return [f"    ae_emit_text(\"{_c_string(expr.id)}\");"]
+                return [f"{pad}{emitter}(&{expr.id});" if kind == "tensor" else f"{pad}{emitter}({expr.id});"]
+            return [f'{pad}ae_emit_text("{_c_string(expr.id)}");']
         if isinstance(expr, Literal):
-            return [f'    ae_emit_text("{_c_string(str(expr.value))}");']
+            return [f'{pad}ae_emit_text("{_c_string(str(expr.value))}");']
         if isinstance(expr, Call) and expr.name == "run":
-            return [f"    {_run_expr(expr, known, chunks)};"]
-        return ["    (void)0;"]
+            return [f"{pad}{_run_expr(expr, known, chunks)};"]
+        return [f"{pad}(void)0;"]
 
     if stmt.kind == "return":
-        return [f"    return {_expr_c(stmt.expr, known, chunks)};"]
+        return [f"{pad}return {_expr_c(stmt.expr, known, chunks)};"]
 
     if stmt.kind == "train":
         return [
-            f"    {{ int heals = 0, steps = 0; double accuracy = 0.0;",
-            f"      ae_train(&{stmt.target}, &{stmt.data}, {stmt.epochs}, 256, 0.1f, &heals, &steps, &accuracy); }}",
+            f"{pad}{{ int heals = 0, steps = 0; double accuracy = 0.0;",
+            f"{pad}  ae_train(&{stmt.target}, &{stmt.data}, {stmt.epochs}, 256, 0.1f, &heals, &steps, &accuracy); }}",
         ]
 
     if stmt.kind == "export":
         path = _c_string((stmt.path or "").replace("\\", "/"))
-        return [f'    ae_export(&{stmt.target}, "{path}");']
+        return [f'{pad}ae_export(&{stmt.target}, "{path}");']
 
     if stmt.kind == "serve":
         route = "/predict"
@@ -1533,14 +1645,12 @@ def _stmt_c(
                 if isinstance(value, Literal) and isinstance(value.value, str):
                     route = value.value
                     break
-        return [
-            f'    ae_http_serve(&{stmt.target}, {stmt.port or 8080}, "{_c_string(route)}");'
-        ]
+        return [f'{pad}ae_http_serve(&{stmt.target}, {stmt.port or 8080}, "{_c_string(route)}");']
 
     if stmt.kind == "expr" and isinstance(stmt.expr, Call) and stmt.expr.name == "run":
-        return [f"    {_run_expr(stmt.expr, known, chunks)};"]
+        return [f"{pad}{_run_expr(stmt.expr, known, chunks)};"]
 
-    return ["    (void)0;"]
+    return [f"{pad}(void)0;"]
 
 
 def generate_c(

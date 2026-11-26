@@ -25,8 +25,9 @@ _TOKEN_RE = re.compile(
       (?P<NUMBER>\d+(?:\.\d+)?)
     | (?P<STRING>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')
     | (?P<ARROW>->)
+    | (?P<OP>==|!=|>=|<=)
     | (?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)
-    | (?P<PUNCT>[=:,()\[\].])
+    | (?P<PUNCT>[=:,()\[\].+\-*/%<>])
     """,
     re.VERBOSE,
 )
@@ -91,13 +92,18 @@ def tokenize(source: str, path: str = "<aether>") -> list[Token]:
                     lineno,
                     pos + 1,
                     code="AE0001",
-                    hint="Aether v0.1 supports literals, identifiers, '->', and () , : = .",
+                    hint=(
+                        "Aether supports literals, identifiers, '->', arithmetic "
+                        "(+ - * / %), comparisons (== != > < >= <=), and ( ) , : = ."
+                    ),
                 )
 
             kind = match.lastgroup or "PUNCT"
             text = match.group()
             column = pos + 1
-            if kind == "STRING":
+            if kind == "OP":
+                tokens.append(Token("PUNCT", text, lineno, column))
+            elif kind == "STRING":
                 try:
                     value = ast.literal_eval(text)
                 except (ValueError, SyntaxError):

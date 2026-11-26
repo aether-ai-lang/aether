@@ -54,8 +54,25 @@ class Call:
 
 
 @dataclass
+class Binary:
+    op: str  # + - * / % == != > < >= <=
+    left: object
+    right: object
+    line: int
+    column: int
+
+
+@dataclass
+class Unary:
+    op: str  # -
+    operand: object
+    line: int
+    column: int
+
+
+@dataclass
 class Stmt:
-    kind: str  # assign | emit | return | expr | train | export | serve
+    kind: str  # assign | let | emit | return | expr | train | export | serve | repeat | if | log
     expr: object | None
     line: int
     column: int
@@ -65,6 +82,9 @@ class Stmt:
     epochs: int | None = None
     path: str | None = None
     port: int | None = None
+    count: object | None = None  # repeat: Literal | Name
+    body: list["Stmt"] = field(default_factory=list)
+    else_body: list["Stmt"] = field(default_factory=list)
     modifiers: list[Modifier] = field(default_factory=list)
 
 

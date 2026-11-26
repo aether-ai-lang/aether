@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ast_nodes import Arg, Call, Literal, Modifier, Name, Program, Stmt, Task, Use
+from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary, Use
 from .diagnostics import AetherError, replace_line_patch
 from .lexer import Token
 
@@ -140,26 +140,7 @@ class Parser:
         self.advance()
         self.expect("NEWLINE")
 
-        if not self.at("INDENT"):
-            token = self.peek()
-            raise AetherError(
-                "Task body must be indented",
-                token.line,
-                token.column,
-                code="AE0100",
-                hint="Indent each statement under the task by 4 spaces.",
-            )
-        self.advance()
-
-        body: list[Stmt] = []
-        while not self.at("DEDENT") and not self.at("EOF"):
-            if self.at("NEWLINE"):
-                self.advance()
-                continue
-            body.append(self.parse_stmt())
-
-        if self.at("DEDENT"):
-            self.advance()
+        body = self.parse_indented_block("task body")
 
         end_line = body[-1].line if body else start.line
         return Task(
@@ -172,6 +153,27 @@ class Parser:
         )
 
     # ------------------------------------------------------------- statements
+    def parse_indented_block(self, what: str) -> list[Stmt]:
+        if not self.at("INDENT"):
+            token = self.peek()
+            raise AetherError(
+                f"{what.capitalize()} must be indented",
+                token.line,
+                token.column,
+                code="AE0100",
+                hint="Indent each statement of the block by 4 spaces.",
+            )
+        self.advance()
+        body: list[Stmt] = []
+        while not self.at("DEDENT") and not self.at("EOF"):
+            if self.at("NEWLINE"):
+                self.advance()
+                continue
+            body.append(self.parse_stmt())
+        if self.at("DEDENT"):
+            self.advance()
+        return body
+
     def parse_stmt(self) -> Stmt:
         token = self.peek()
 
@@ -181,6 +183,14 @@ class Parser:
             return self.parse_export()
         if self.at_keyword("serve"):
             return self.parse_serve()
+        if self.at_keyword("let"):
+            return self.parse_let()
+        if self.at_keyword("repeat"):
+            return self.parse_repeat()
+        if self.at_keyword("if"):
+            return self.parse_if()
+        if self.at_keyword("log"):
+            return self.parse_log()
 
         if self.at_keyword("emit") or self.at_keyword("return"):
             kind = "emit" if token.value == "emit" else "return"
@@ -205,6 +215,87 @@ class Parser:
         expr = self.parse_expr()
         self.expect("NEWLINE")
         return Stmt(kind="expr", expr=expr, line=token.line, column=token.column)
+
+    def parse_let(self) -> Stmt:
+        start = self.expect("IDENT", "let")
+        name = self.expect(
+            "IDENT", hint="Use: let threshold = 0.85"
+        )
+        self.expect(
+            "PUNCT", "=", hint="Use: let threshold = 0.85"
+        )
+        expr = self.parse_expr()
+        self.expect("NEWLINE")
+        return Stmt(
+            kind="let",
+            expr=expr,
+            line=start.line,
+            column=start.column,
+            name=str(name.value),
+        )
+
+    def parse_repeat(self) -> Stmt:
+        start = self.expect("IDENT", "repeat")
+        token = self.peek()
+        if token.kind == "NUMBER" and isinstance(token.value, int):
+            self.advance()
+            count: object = Literal(token.value, token.line, token.column, raw=str(token.value))
+        elif token.kind == "IDENT":
+            self.advance()
+            count = Name(str(token.value), token.line, token.column)
+        else:
+            raise AetherError(
+                f"Expected a repeat count, found {self.describe(token)}",
+                token.line,
+                token.column,
+                code="AE0212",
+                hint="Use: repeat 10 times: (an integer literal or an int variable).",
+            )
+        times = self.expect(
+            "IDENT", "times", hint="Use: repeat 10 times:"
+        )
+        self.expect(
+            "PUNCT", ":", hint="A colon ends the repeat header, then indent the body."
+        )
+        self.expect("NEWLINE")
+        body = self.parse_indented_block("repeat body")
+        return Stmt(
+            kind="repeat",
+            expr=None,
+            line=start.line,
+            column=start.column,
+            count=count,
+            body=body,
+        )
+
+    def parse_if(self) -> Stmt:
+        start = self.expect("IDENT", "if")
+        condition = self.parse_expr()
+        self.expect("PUNCT", ":", hint="A colon ends the if header, then indent the body.")
+        self.expect("NEWLINE")
+        body = self.parse_indented_block("if body")
+
+        else_body: list[Stmt] = []
+        if self.at_keyword("else"):
+            self.advance()
+            self.expect("PUNCT", ":", hint="'else:' takes no condition.")
+            self.expect("NEWLINE")
+            else_body = self.parse_indented_block("else body")
+
+        return Stmt(
+            kind="if",
+            expr=condition,
+            line=start.line,
+            column=start.column,
+            body=body,
+            else_body=else_body,
+        )
+
+    def parse_log(self) -> Stmt:
+        start = self.expect("IDENT", "log")
+        expr = self.parse_expr()
+        self.expect("NEWLINE")
+        return Stmt(kind="log", expr=expr, line=start.line, column=start.column)
 
     def parse_train(self) -> Stmt:
         start = self.expect("IDENT", "train")
@@ -334,35 +425,7 @@ class Parser:
 
     # ------------------------------------------------------------ expressions
     def parse_expr(self) -> object:
-        token = self.peek()
-        node: object
-
-        if token.kind == "NUMBER":
-            self.advance()
-            node = Literal(token.value, token.line, token.column, raw=str(token.value))
-        elif token.kind == "STRING":
-            self.advance()
-            node = Literal(token.value, token.line, token.column)
-        elif token.kind == "IDENT" and token.value == "run" and self.peek(1).kind == "IDENT":
-            self.advance()
-            target = self.expect("IDENT")
-            args = self.parse_args()
-            node = Call("run", str(target.value), args, [], token.line, token.column)
-        elif token.kind == "IDENT":
-            self.advance()
-            if self.at("PUNCT", "("):
-                node = Call(str(token.value), None, self.parse_args(), [], token.line, token.column)
-            else:
-                node = Name(str(token.value), token.line, token.column)
-        else:
-            raise AetherError(
-                f"Expected an expression, found {self.describe(token)}",
-                token.line,
-                token.column,
-                code="AE0100",
-                hint="Use an intent call such as tensor(...), neural_net(...), or run model(data).",
-            )
-
+        node = self.parse_comparison()
         while self.at("ARROW"):
             if not isinstance(node, Call):
                 raise AetherError(
@@ -375,6 +438,74 @@ class Parser:
             node.modifiers.append(self.parse_modifier())
 
         return node
+
+    # ------------------------------------------------- expression precedence
+    # comparison < additive < term < unary < primary
+    def parse_comparison(self) -> object:
+        node = self.parse_additive()
+        while self.at("PUNCT") and self.peek().value in ("==", "!=", ">", "<", ">=", "<="):
+            token = self.advance()
+            right = self.parse_additive()
+            node = Binary(str(token.value), node, right, token.line, token.column)
+        return node
+
+    def parse_additive(self) -> object:
+        node = self.parse_term()
+        while self.at("PUNCT") and self.peek().value in ("+", "-"):
+            token = self.advance()
+            right = self.parse_term()
+            node = Binary(str(token.value), node, right, token.line, token.column)
+        return node
+
+    def parse_term(self) -> object:
+        node = self.parse_unary()
+        while self.at("PUNCT") and self.peek().value in ("*", "/", "%"):
+            token = self.advance()
+            right = self.parse_unary()
+            node = Binary(str(token.value), node, right, token.line, token.column)
+        return node
+
+    def parse_unary(self) -> object:
+        if self.at("PUNCT", "-"):
+            token = self.advance()
+            operand = self.parse_unary()
+            return Unary("-", operand, token.line, token.column)
+        return self.parse_primary()
+
+    def parse_primary(self) -> object:
+        token = self.peek()
+
+        if token.kind == "NUMBER":
+            self.advance()
+            return Literal(token.value, token.line, token.column, raw=str(token.value))
+        if token.kind == "STRING":
+            self.advance()
+            return Literal(token.value, token.line, token.column)
+        if self.at("PUNCT", "("):
+            self.advance()
+            node = self.parse_comparison()
+            self.expect("PUNCT", ")", hint="Close the parenthesized expression with ')'.")
+            return node
+        if token.kind == "IDENT" and token.value == "run" and self.peek(1).kind == "IDENT":
+            self.advance()
+            target = self.expect("IDENT")
+            args = self.parse_args()
+            return Call("run", str(target.value), args, [], token.line, token.column)
+        if token.kind == "IDENT":
+            self.advance()
+            if self.at("PUNCT", "("):
+                return Call(str(token.value), None, self.parse_args(), [], token.line, token.column)
+            return Name(str(token.value), token.line, token.column)
+        raise AetherError(
+            f"Expected an expression, found {self.describe(token)}",
+            token.line,
+            token.column,
+            code="AE0100",
+            hint=(
+                "Use a number, string, variable, intent call, or arithmetic "
+                "such as (a + b) * 2."
+            ),
+        )
 
     def parse_args(self) -> list[Arg]:
         self.expect("PUNCT", "(", hint="Intent calls need parentheses, e.g. tensor(512, 512).")

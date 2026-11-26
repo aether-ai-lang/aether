@@ -1,0 +1,5 @@
+# Intentionally invalid: used to demonstrate AI self-healing diagnostics.
+task SelfHeal:
+    data = tensor(32, 32)
+    net = neural_net(in: data, out: 64)
+    run net(data)

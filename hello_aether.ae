@@ -1,0 +1,6 @@
+﻿use ai.core
+
+task HelloAether:
+    data = tensor(2048, 1024) -> auto_hardware
+    net = neural_net(in: data, out: 256) -> optimize(speed: max)
+    run net(data) -> stream_output

@@ -1,0 +1,8 @@
+﻿use ai.core
+
+task TrainAgent:
+    dataset = load_data(samples: 10000, features: 128) -> auto_hardware
+    model = classifier(in: 128, classes: 10) -> optimize(speed: max)
+    train model on dataset(epochs: 5) -> self_heal
+    export model -> "model.ae.bin"
+    run model(dataset) -> stream_output

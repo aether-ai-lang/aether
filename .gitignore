@@ -1,0 +1,12 @@
+# Build artifacts
+.aether_build/
+__pycache__/
+*.py[cod]
+
+# Compiled binaries and model weights
+*.exe
+*.bin
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,8 @@
+# Normalize line endings; Aether's fix_patch diffs are LF-based and must
+# survive a Windows checkout (git apply contract).
+* text=auto
+*.ae  text eol=lf
+*.py  text eol=lf
+*.c   text eol=lf
+*.md  text eol=lf
+*.cmd text eol=crlf

@@ -181,7 +181,7 @@ typedef int ae_socket_t;
 #define AE_CLOSE_SOCKET(s) close(s)
 #endif
 
-#define AE_VERSION "0.4"
+#define AE_VERSION "0.5"
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -313,7 +313,7 @@ typedef struct {
     int in_dim, hidden, out_dim, kind, classes, trained;
     float *w1, *b1, *w2, *b2;
 } Model;
-typedef struct { int rows, out_dim, chunks; double checksum; unsigned digest; double accuracy; } StreamResult;
+typedef struct { int rows, out_dim, chunks; double checksum; unsigned digest; double accuracy; double loss; double gflops; } StreamResult;
 
 static char ae_base_dir[1024] = "";
 
@@ -813,6 +813,8 @@ static StreamResult ae_stream(const Model *m, const Tensor *t, int chunks) {
     result.checksum = checksum;
     result.digest = digest;
     result.accuracy = 0.0;
+    result.loss = 0.0;
+    result.gflops = gflops;
 
     ae_event("{\"event\":\"summary\",\"chunks\":%d,\"rows\":%d,\"out_dim\":%d,\"gflops\":%.6f,\"ms\":%.6f,\"gflops_per_s\":%.6f,\"checksum\":%.6g,\"digest\":\"0x%08x\",\"backend\":\"c\"}",
              total, rows, m->out_dim, gflops, elapsed, elapsed > 0.0 ? gflops / (elapsed / 1000.0) : 0.0, checksum, digest);
@@ -888,6 +890,8 @@ static StreamResult ae_stream_classifier(const Model *m, const Dataset *d, int c
     result.checksum = confidence_sum;
     result.digest = digest;
     result.accuracy = accuracy;
+    result.loss = mean_loss;
+    result.gflops = gflops;
 
     ae_event("{\"event\":\"summary\",\"chunks\":%d,\"rows\":%d,\"out_dim\":%d,\"gflops\":%.6f,\"ms\":%.6f,\"gflops_per_s\":%.6f,\"checksum\":%.6g,\"digest\":\"0x%08x\",\"accuracy\":%.6g,\"loss\":%.6g,\"kind\":\"classifier\",\"backend\":\"c\"}",
              total, d->samples, m->out_dim, gflops, elapsed, elapsed > 0.0 ? gflops / (elapsed / 1000.0) : 0.0, confidence_sum, digest, accuracy, mean_loss);
@@ -926,6 +930,212 @@ static void ae_emit_stream(StreamResult value) {
     ae_event("{\"event\":\"emit_stream\",\"rows\":%d,\"out_dim\":%d,\"checksum\":%.6g,\"digest\":\"0x%08x\",\"accuracy\":%.6g,\"backend\":\"c\"}",
              value.rows, value.out_dim, value.checksum, value.digest, value.accuracy);
     ae_human("  [emit]   stream[%dx%d] checksum=%+.2f digest=0x%08x", value.rows, value.out_dim, value.checksum, value.digest);
+}
+
+/* ---------------------------------------------------------------- data.core */
+static Dataset ae_load_csv(const char *path, const char *target_col) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "rb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot open %s\n", resolved);
+        exit(3);
+    }
+
+    char line[65536];
+    if (!fgets(line, sizeof(line), handle)) {
+        fprintf(stderr, "aether: %s is empty\n", resolved);
+        exit(3);
+    }
+    /* header: split on commas, locate the target column */
+    char columns[512][64];
+    int column_count = 0;
+    char *cursor = line;
+    while (*cursor) {
+        char *comma = strchr(cursor, ',');
+        size_t span = comma ? (size_t)(comma - cursor) : strlen(cursor);
+        if (span > 0 && cursor[span - 1] == '\n') span--;
+        if (span > 0 && cursor[span - 1] == '\r') span--;
+        if (span >= 64) span = 63;
+        memcpy(columns[column_count], cursor, span);
+        columns[column_count][span] = 0;
+        column_count++;
+        if (!comma) break;
+        cursor = comma + 1;
+    }
+    int target_index = -1;
+    for (int i = 0; i < column_count; i++) {
+        if (strcmp(columns[i], target_col) == 0) target_index = i;
+    }
+    if (target_index < 0) {
+        fprintf(stderr, "aether: target column '%s' not in %s header\n", target_col, resolved);
+        exit(3);
+    }
+    int features = column_count - 1;
+    if (features < 1 || features > 4096) {
+        fprintf(stderr, "aether: %s has an unsupported feature count (%d)\n", resolved, features);
+        exit(3);
+    }
+
+    size_t capacity = 1024;
+    long long rows = 0;
+    float *x = ae_falloc(capacity * (size_t)features);
+    int *labels = (int *)ae_alloc(capacity * sizeof(int));
+    char label_names[256][64];
+    int label_count = 0;
+    int feature_order[4096];
+    int f = 0;
+    for (int i = 0; i < column_count; i++) {
+        if (i != target_index) feature_order[f++] = i;
+    }
+
+    while (fgets(line, sizeof(line), handle)) {
+        size_t len = strlen(line);
+        while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = 0;
+        int blank = 1;
+        for (size_t i = 0; i < len; i++) {
+            if (line[i] != ' ' && line[i] != ',') { blank = 0; break; }
+        }
+        if (blank) continue;
+
+        if ((size_t)rows >= capacity) {
+            capacity *= 2;
+            x = (float *)realloc(x, capacity * (size_t)features * sizeof(float));
+            labels = (int *)realloc(labels, capacity * sizeof(int));
+            if (!x || !labels) { fprintf(stderr, "aether: out of memory\n"); exit(3); }
+        }
+
+        char *cells[512];
+        int cell_count = 0;
+        cursor = line;
+        while (*cursor && cell_count < 512) {
+            cells[cell_count++] = cursor;
+            char *comma = strchr(cursor, ',');
+            if (!comma) break;
+            *comma = 0;
+            cursor = comma + 1;
+        }
+        if (cell_count != column_count) {
+            fprintf(stderr, "aether: %s line %lld has %d cells, expected %d\n",
+                    resolved, rows + 2, cell_count, column_count);
+            exit(3);
+        }
+
+        float *row = x + (size_t)rows * features;
+        for (int i = 0; i < features; i++) {
+            row[i] = strtof(cells[feature_order[i]], NULL);
+        }
+
+        char *label_text = cells[target_index];
+        char *end = NULL;
+        float numeric = strtof(label_text, &end);
+        int label;
+        if (end != label_text && *end == 0) {
+            label = (int)numeric;
+        } else {
+            label = -1;
+            for (int i = 0; i < label_count; i++) {
+                if (strcmp(label_names[i], label_text) == 0) { label = i; break; }
+            }
+            if (label < 0) {
+                if (label_count >= 256) {
+                    fprintf(stderr, "aether: too many distinct labels in %s\n", resolved);
+                    exit(3);
+                }
+                snprintf(label_names[label_count], 64, "%s", label_text);
+                label = label_count++;
+            }
+        }
+        labels[rows] = label;
+        rows++;
+    }
+    fclose(handle);
+
+    int classes = 2;
+    for (long long i = 0; i < rows; i++) {
+        if (labels[i] + 1 > classes) classes = labels[i] + 1;
+    }
+    if (label_count > 0) classes = label_count;
+    if (rows < 1) {
+        fprintf(stderr, "aether: %s has no data rows\n", resolved);
+        exit(3);
+    }
+
+    Dataset d;
+    d.samples = (int)rows;
+    d.features = features;
+    d.classes = classes;
+    d.x = x;
+    d.y = labels;
+
+    double mib = ((double)((size_t)rows * features * sizeof(float)) +
+                  (double)((size_t)rows * sizeof(int))) / (1024.0 * 1024.0);
+    char escaped[2400];
+    ae_json_escape(resolved, escaped, sizeof(escaped));
+    ae_event("{\"event\":\"dataset\",\"samples\":%d,\"features\":%d,\"classes\":%d,\"mib\":%.6f,\"source\":\"%s\",\"backend\":\"c\"}",
+             d.samples, features, classes, mib, escaped);
+    ae_human("  [dataset] %d rows x %d features | %d classes | %.2f MiB | from %s",
+             d.samples, features, classes, mib, resolved);
+    return d;
+}
+
+static void ae_save_json_text(const char *path, const char *json) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "wb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot write %s\n", resolved);
+        exit(3);
+    }
+    fputs(json, handle);
+    long bytes = ftell(handle);
+    fclose(handle);
+    char escaped[2400];
+    ae_json_escape(resolved, escaped, sizeof(escaped));
+    ae_event("{\"event\":\"save_json\",\"path\":\"%s\",\"bytes\":%ld,\"backend\":\"c\"}", escaped, bytes);
+    ae_human("  [json]   %s | %ld bytes", resolved, bytes);
+}
+
+static void ae_save_json_scalar(const char *key, double value, const char *path) {
+    char json[256];
+    snprintf(json, sizeof(json), "{\n  \"%s\": %.17g\n}\n", key, ae_finite(value));
+    ae_save_json_text(path, json);
+}
+
+static void ae_save_json_stream(const StreamResult *r, const char *path) {
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\n  \"rows\": %d,\n  \"out_dim\": %d,\n  \"chunks\": %d,\n"
+             "  \"accuracy\": %.6f,\n  \"loss\": %.6f,\n  \"gflops\": %.6f,\n"
+             "  \"checksum\": %.6g,\n  \"digest\": \"0x%08x\"\n}\n",
+             r->rows, r->out_dim, r->chunks, ae_finite(r->accuracy), ae_finite(r->loss),
+             r->gflops, r->checksum, r->digest);
+    ae_save_json_text(path, json);
+}
+
+static void ae_save_json_model(const Model *m, const char *path) {
+    char json[320];
+    snprintf(json, sizeof(json),
+             "{\n  \"kind\": \"%s\",\n  \"in_dim\": %d,\n  \"hidden\": %d,\n"
+             "  \"out_dim\": %d,\n  \"classes\": %d,\n  \"params\": %d,\n"
+             "  \"trained\": %s\n}\n",
+             m->kind ? "classifier" : "mlp", m->in_dim, m->hidden, m->out_dim,
+             m->classes, m->in_dim * m->hidden + m->hidden + m->hidden * m->out_dim + m->out_dim,
+             m->trained ? "true" : "false");
+    ae_save_json_text(path, json);
+}
+
+static void ae_while_guard(long long max_iters) {
+    ae_event("{\"event\":\"while_guard\",\"max_iters\":%lld,\"message\":\"while loop hit max_iters(%lld); exiting\",\"backend\":\"c\"}",
+             max_iters, max_iters);
+    ae_human("  [guard]  while loop hit max_iters(%lld); exiting", max_iters);
+}
+
+/* Trains and returns the best validation accuracy (the `accuracy` binding). */
+static double ae_train_accuracy(Model *m, Dataset *d, int epochs, int batch, float lr, int *heals, int *steps) {
+    double accuracy = 0.0;
+    ae_train(m, d, epochs, batch, lr, heals, steps, &accuracy);
+    return accuracy;
 }
 
 /* ------------------------------------------------------------- AEB1 loading */
@@ -1375,6 +1585,8 @@ def _types(task: Task) -> dict[str, tuple[str, str]]:
             known[stmt.name or ""] = ("tensor", "")
         elif call.name == "load_data":
             known[stmt.name or ""] = ("dataset", "")
+        elif call.name == "load_csv":
+            known[stmt.name or ""] = ("dataset", "")
         elif call.name == "neural_net":
             known[stmt.name or ""] = ("model", "mlp")
         elif call.name == "classifier":
@@ -1463,6 +1675,24 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
             f"ae_model_new({_int(bound.get('in'))}, {_int(bound.get('hidden'), 128)}, "
             f"{_int(bound.get('classes'))}, 1)"
         )
+    if node.name == "load_csv":
+        bound = _bind(node, ["path", "target", "classes"])
+        path_node = bound.get("path")
+        target_node = bound.get("target")
+        path = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "data.csv"
+        )
+        target = (
+            target_node.value
+            if isinstance(target_node, Literal) and isinstance(target_node.value, str)
+            else "target"
+        )
+        return (
+            f'ae_load_csv("{_c_string(path.replace(chr(92), "/"))}", '
+            f'"{_c_string(target)}")'
+        )
     if node.name == "load_model":
         bound = _bind(node, ["path"])
         node_path = bound.get("path")
@@ -1472,12 +1702,42 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
             else "model.ae.bin"
         )
         return f'ae_model_load("{_c_string(text)}")'
+    if node.name == "save_json":
+        bound = _bind(node, ["value", "path"])
+        value = bound.get("value")
+        path_node = bound.get("path")
+        path = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "report.json"
+        )
+        path = _c_string(path.replace("\\", "/"))
+        if isinstance(value, Name):
+            kind, _detail = known.get(value.id, ("value", ""))
+            if kind == "stream":
+                return f'ae_save_json_stream(&{value.id}, "{path}")'
+            if kind == "model":
+                return f'ae_save_json_model(&{value.id}, "{path}")'
+            return f'ae_save_json_scalar("{_c_string(value.id)}", (double)({value.id}), "{path}")'
+        if isinstance(value, Literal):
+            literal = (
+                f'"{_c_string(str(value.value))}"'
+                if isinstance(value.value, str)
+                else str(value.value)
+            )
+            return f'ae_save_json_scalar("value", (double)({literal}), "{path}")'
+        return 'ae_save_json_scalar("value", 0.0, "")'
+    if node.name in _FNS:
+        args = [_expr_c(arg.value, known, chunks) for arg in node.args]
+        return f"ae_fn_{node.name}({', '.join(args)})"
     if node.name == "run":
         return _run_expr(node, known, chunks)
     raise CBackendError(f"intent '{node.name}' is not supported by the C backend yet")
 
 
 _WIDTHS: dict[str, int] = {}
+_FNS: set[str] = set()
+_GUARD_ID: list[int] = [0]
 
 
 def _known_width(node: object, known: dict[str, tuple[str, str]]) -> int:
@@ -1489,6 +1749,8 @@ def _known_width(node: object, known: dict[str, tuple[str, str]]) -> int:
 def _collect_scalars(body: list[Stmt], decls: dict[str, str], strings: set[str]) -> None:
     """Pre-declare every `let` scalar at function scope (C needs declarations)."""
     for stmt in _iter_statements(body):
+        if stmt.kind == "train" and "accuracy" not in decls:
+            decls["accuracy"] = "double"
         if stmt.kind != "let" or not stmt.name:
             continue
         if stmt.name in decls:
@@ -1501,6 +1763,7 @@ def _collect_scalars(body: list[Stmt], decls: dict[str, str], strings: set[str])
 
 def _task_c(task: Task, chunks: int) -> list[str]:
     _WIDTHS.clear()
+    _GUARD_ID[0] = 0
     known = _types(task)
     for stmt in _iter_statements(task.body):
         if stmt.kind == "assign" and isinstance(stmt.expr, Call):
@@ -1588,6 +1851,25 @@ def _stmt_c(
         lines.append(f"{pad}}}")
         return lines
 
+    if stmt.kind == "while":
+        condition = _expr_c(stmt.expr, known, chunks)
+        max_iters = int(stmt.max_iters or 100_000)
+        _GUARD_ID[0] += 1
+        guard = f"ae_g{_GUARD_ID[0]}"
+        lines = [f"{pad}long long {guard} = 0;"]
+        lines.append(f"{pad}while ({condition}) {{")
+        lines.append(f"{pad}    {guard}++;")
+        lines.append(f"{pad}    if ({guard} > {max_iters}) {{ ae_while_guard({max_iters}); break; }}")
+        lines.extend(render_inner(stmt.body))
+        lines.append(f"{pad}}}")
+        return lines
+
+    if stmt.kind == "train":
+        return [
+            f"{pad}{{ int heals = 0, steps = 0;",
+            f"{pad}  accuracy = ae_train_accuracy(&{stmt.target}, &{stmt.data}, {stmt.epochs}, 256, 0.1f, &heals, &steps); }}",
+        ]
+
     if stmt.kind == "if":
         condition = _expr_c(stmt.expr, known, chunks)
         lines = [f"{pad}if ({condition}) {{"]
@@ -1627,12 +1909,6 @@ def _stmt_c(
     if stmt.kind == "return":
         return [f"{pad}return {_expr_c(stmt.expr, known, chunks)};"]
 
-    if stmt.kind == "train":
-        return [
-            f"{pad}{{ int heals = 0, steps = 0; double accuracy = 0.0;",
-            f"{pad}  ae_train(&{stmt.target}, &{stmt.data}, {stmt.epochs}, 256, 0.1f, &heals, &steps, &accuracy); }}",
-        ]
-
     if stmt.kind == "export":
         path = _c_string((stmt.path or "").replace("\\", "/"))
         return [f'{pad}ae_export(&{stmt.target}, "{path}");']
@@ -1647,10 +1923,34 @@ def _stmt_c(
                     break
         return [f'{pad}ae_http_serve(&{stmt.target}, {stmt.port or 8080}, "{_c_string(route)}");']
 
-    if stmt.kind == "expr" and isinstance(stmt.expr, Call) and stmt.expr.name == "run":
-        return [f"{pad}{_run_expr(stmt.expr, known, chunks)};"]
+    if stmt.kind == "expr" and isinstance(stmt.expr, Call):
+        return [f"{pad}{_expr_c(stmt.expr, known, chunks)};"]
 
     return [f"{pad}(void)0;"]
+
+
+_FN_RET_C = {"float": "double", "int": "long long", "bool": "int", "str": "const char *"}
+_FN_FALLBACK = {"float": "0.0", "int": "0", "bool": "0", "str": '""'}
+
+
+def _fn_c(function: Function) -> list[str]:
+    ret = _FN_RET_C[function.ret_type]
+    params = ", ".join(f"double {p}" for p in function.params)
+    if not params:
+        params = "void"
+    decls: dict[str, str] = {}
+    strings: set[str] = set()
+    _collect_scalars(function.body, decls, strings)
+
+    lines = [f"static {ret} ae_fn_{function.name}({params}) {{"]
+    for scalar, ctype in decls.items():
+        initializer = '""' if ctype.startswith("const char") else ("0.0" if ctype == "double" else "0")
+        lines.append(f"    {ctype} {scalar} = {initializer};")
+    for stmt in function.body:
+        lines.extend(_stmt_c(stmt, {}, chunks=8, depth=0, strings=strings))
+    lines.append(f"    return {_FN_FALLBACK[function.ret_type]};  /* fall-through guard */")
+    lines.append("}")
+    return lines
 
 
 def generate_c(
@@ -1660,10 +1960,20 @@ def generate_c(
     chunks: int = 8,
 ) -> str:
     _WIDTHS.clear()
+    _FNS.clear()
+    _FNS.update(fn.name for fn in program.functions)
     source = _json_string(source_name.replace("\\", "/"))
     header = PREAMBLE.replace("__SOURCE__", source)
     out = [header]
+    for fn in program.functions:
+        out.append(f"static {_FN_RET_C[fn.ret_type]} ae_fn_{fn.name}(")
+        params = ", ".join("double" for _ in fn.params) or "void"
+        out.append(f"    {params});")
+    out.append("")
     names = [task.name for task in program.tasks if not tasks or task.name in tasks]
+    for fn in program.functions:
+        out.extend(_fn_c(fn))
+        out.append("")
     for task in program.tasks:
         if tasks and task.name not in tasks:
             continue
@@ -1698,8 +2008,10 @@ def generate_c(
     out.append("    openblas_set_num_threads(ae_max_threads);")
     out.append("    ae_blas_current = ae_max_threads;")
     out.append("    #endif")
-    out.append('    ae_event("{\\"event\\":\\"device\\",\\"device\\":\\"cpu\\",\\"machine\\":\\"native\\",\\"threads\\":%d,\\"compiler\\":\\"__CC__\\",\\"blas\\":\\"__BLAS__\\",\\"dtype\\":\\"f32\\",\\"backend\\":\\"c\\"}", threads);')
-    out.append('    ae_human("  [device] auto_hardware -> c/native | %d threads | __BLAS__ | f32", threads);')
+    out.append('    const char *tier = getenv("AETHER_DEVICE_TIER");')
+    out.append('    if (!tier || !tier[0]) tier = "cpu";')
+    out.append('    ae_event("{\\"event\\":\\"device\\",\\"device\\":\\"cpu\\",\\"machine\\":\\"native\\",\\"threads\\":%d,\\"compiler\\":\\"__CC__\\",\\"blas\\":\\"__BLAS__\\",\\"dtype\\":\\"f32\\",\\"tier\\":\\"%s\\",\\"backend\\":\\"c\\"}", threads, tier);')
+    out.append('    ae_human("  [device] auto_hardware -> c/native | %d threads | __BLAS__ | %s tier | f32", threads, tier);')
     first = True
     for name in names:
         condition = f'(!task || strcmp(task, "{name}") == 0)' if first else f'(task && strcmp(task, "{name}") == 0)'
@@ -1899,3 +2211,126 @@ def parse_events(stderr: str) -> list[dict]:
         except ValueError:
             continue
     return events
+
+
+# ---------------------------------------------------------------------- CUDA
+CUDA_TEMPLATE = r"""/*
+ * Aether 0.5 -- generated CUDA execution plan. DO NOT EDIT.
+ * source: __SOURCE__
+ * plan:   f32 | CUDA kernels | one thread per output element
+ */
+#include <cuda_runtime.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+__global__ void ae_gemm_bias_relu(const float *x, const float *w, const float *b,
+                                  float *h, int rows, int in_dim, int out_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= out_dim) return;
+    float acc = b[col];
+    for (int k = 0; k < in_dim; k++) {
+        acc += x[(size_t)row * in_dim + k] * w[(size_t)k * out_dim + col];
+    }
+    h[(size_t)row * out_dim + col] = acc > 0.0f ? acc : 0.0f;
+}
+
+__global__ void ae_gemm_bias(const float *h, const float *w, const float *b,
+                             float *y, int rows, int in_dim, int out_dim) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows || col >= out_dim) return;
+    float acc = b[col];
+    for (int k = 0; k < in_dim; k++) {
+        acc += h[(size_t)row * in_dim + k] * w[(size_t)k * out_dim + col];
+    }
+    y[(size_t)row * out_dim + col] = acc;
+}
+
+static void ae_cuda_check(cudaError_t err, const char *what) {
+    if (err != cudaSuccess) {
+        fprintf(stderr, "aether: %s failed: %s\n", what, cudaGetErrorString(err));
+        exit(3);
+    }
+}
+
+/* Layered forward pass for one pre-trained AEB1 model (inference demo). */
+static void ae_cuda_forward(const float *x, const float *w1, const float *b1,
+                            const float *w2, const float *b2, float *y,
+                            int rows, int in_dim, int hidden, int out_dim) {
+    float *d_x, *d_w1, *d_b1, *d_h, *d_w2, *d_b2, *d_y;
+    size_t xs = (size_t)rows * in_dim * 4, w1s = (size_t)in_dim * hidden * 4;
+    size_t h1s = (size_t)rows * hidden * 4, w2s = (size_t)hidden * out_dim * 4;
+    size_t y1s = (size_t)rows * out_dim * 4;
+    ae_cuda_check(cudaMalloc(&d_x, xs), "cudaMalloc x");
+    ae_cuda_check(cudaMalloc(&d_w1, w1s), "cudaMalloc w1");
+    ae_cuda_check(cudaMalloc(&d_b1, (size_t)hidden * 4), "cudaMalloc b1");
+    ae_cuda_check(cudaMalloc(&d_h, h1s), "cudaMalloc h");
+    ae_cuda_check(cudaMalloc(&d_w2, w2s), "cudaMalloc w2");
+    ae_cuda_check(cudaMalloc(&d_b2, (size_t)out_dim * 4), "cudaMalloc b2");
+    ae_cuda_check(cudaMalloc(&d_y, y1s), "cudaMalloc y");
+
+    ae_cuda_check(cudaMemcpy(d_x, x, xs, cudaMemcpyHostToDevice), "copy x");
+    ae_cuda_check(cudaMemcpy(d_w1, w1, w1s, cudaMemcpyHostToDevice), "copy w1");
+    ae_cuda_check(cudaMemcpy(d_b1, b1, (size_t)hidden * 4, cudaMemcpyHostToDevice), "copy b1");
+    ae_cuda_check(cudaMemcpy(d_w2, w2, w2s, cudaMemcpyHostToDevice), "copy w2");
+    ae_cuda_check(cudaMemcpy(d_b2, b2, (size_t)out_dim * 4, cudaMemcpyHostToDevice), "copy b2");
+
+    dim3 block(16, 16);
+    dim3 grid1((hidden + 15) / 16, (rows + 15) / 16);
+    ae_gemm_bias_relu<<<grid1, block>>>(d_x, d_w1, d_b1, d_h, rows, in_dim, hidden);
+    dim3 grid2((out_dim + 15) / 16, (rows + 15) / 16);
+    ae_gemm_bias<<<grid2, block>>>(d_h, d_w2, d_b2, d_y, rows, hidden, out_dim);
+    ae_cuda_check(cudaGetLastError(), "kernel launch");
+    ae_cuda_check(cudaDeviceSynchronize(), "sync");
+    ae_cuda_check(cudaMemcpy(y, d_y, y1s, cudaMemcpyDeviceToHost), "copy y");
+
+    cudaFree(d_x); cudaFree(d_w1); cudaFree(d_b1); cudaFree(d_h);
+    cudaFree(d_w2); cudaFree(d_b2); cudaFree(d_y);
+}
+
+int main(void) {
+    int device = 0;
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "aether: no CUDA device: %s\n", cudaGetErrorString(err));
+        return 3;
+    }
+    printf("  [device] auto_hardware -> cuda/%s | SM %d.%d | %d SMs | %.1f GB\n",
+           prop.name, prop.major, prop.minor, prop.multiProcessorCount,
+           (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+    fflush(stdout);
+    return 0;
+}
+"""
+
+
+def generate_cuda(program: Program, source_name: str) -> str:
+    """Emit a CUDA execution plan (inference kernels + device telemetry)."""
+    source = _json_string(source_name.replace("\\", "/"))
+    return CUDA_TEMPLATE.replace("__SOURCE__", source)
+
+
+def compile_cuda(source: str, out_dir: Path, stem: str) -> tuple[Path, float, str]:
+    nvcc = shutil.which("nvcc")
+    if not nvcc:
+        raise CBackendError("nvcc not found on PATH")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    source_file = out_dir / f"{stem}.cu"
+    source_file.write_text(source, encoding="utf-8", newline="\n")
+    binary = out_dir / (f"{stem}_cuda.exe" if os.name == "nt" else f"{stem}_cuda")
+    command = [nvcc, "-O3", "-arch=native", "-o", str(binary), str(source_file)]
+    started = time.perf_counter()
+    proc = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    compile_ms = (time.perf_counter() - started) * 1000.0
+    if proc.returncode != 0 or not binary.is_file():
+        raise CBackendError(
+            "nvcc compilation failed\n"
+            + " ".join(command)
+            + "\n"
+            + (proc.stdout or "")
+            + (proc.stderr or "")
+        )
+    return binary, compile_ms, " ".join(command)

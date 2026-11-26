@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary
+from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Program, Stmt, Task, Unary
 from .diagnostics import AETHER_VERSION
+
+_USER_FNS: set[str] = set()
 
 
 def _bind(call: Call, names: list[str]) -> dict[str, object]:
@@ -77,6 +79,12 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
     if not isinstance(call, Call):
         return "None"
 
+    if call.name in _USER_FNS:
+        args = []
+        for arg in call.args:
+            args.append(_expr_src(arg.value, task_policy))
+        return f"ae_fn_{call.name}({', '.join(args)})"
+
     if call.name == "tensor":
         bound = _bind(call, ["rows", "cols"])
         return f"rt.tensor({_value_src(bound.get('rows'))}, {_value_src(bound.get('cols'))})"
@@ -93,6 +101,18 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
             f"{extra})"
         )
 
+    if call.name == "load_csv":
+        bound = _bind(call, ["path", "target", "classes"])
+        return (
+            f"rt.load_csv({_value_src(bound.get('path'))}, "
+            f"target={_value_src(bound.get('target'))})"
+        )
+    if call.name == "save_json":
+        bound = _bind(call, ["value", "path"])
+        return (
+            f"rt.save_json({_value_src(bound.get('value'))}, "
+            f"{_value_src(bound.get('path'))})"
+        )
     if call.name == "load_model":
         bound = _bind(call, ["path"])
         return f"rt.load_model({_value_src(bound.get('path'))})"
@@ -140,16 +160,22 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
 
 
 def _stmt_src(
-    stmt: Stmt, task_policy: dict | None, source_lines: list[str], depth: int = 0
+    stmt: Stmt,
+    task_policy: dict | None,
+    source_lines: list[str],
+    depth: int = 0,
+    base: int = 2,
 ) -> list[str]:
     """Render one statement; every returned line is fully indented."""
-    pad = "    " * (2 + depth)
+    pad = "    " * (base + depth)
     out: list[str] = [pad + _stmt_comment(stmt, source_lines)]
 
     def render_inner(body: list[Stmt], extra_depth: int) -> list[str]:
         lines: list[str] = []
         for inner in body:
-            lines.extend(_stmt_src(inner, task_policy, source_lines, depth + extra_depth))
+            lines.extend(
+                _stmt_src(inner, task_policy, source_lines, depth + extra_depth, base)
+            )
         return lines or [pad + "    pass"]
 
     if stmt.kind in ("assign", "let"):
@@ -157,6 +183,23 @@ def _stmt_src(
     elif stmt.kind == "repeat":
         out.append(pad + f"for _ae_loop in range(int({_expr_src(stmt.count, task_policy)})):")
         out.extend(render_inner(stmt.body, 1))
+    elif stmt.kind == "while":
+        max_iters = int(stmt.max_iters or 100_000)
+        out.append(pad + f"_ae_guard = 0")
+        out.append(pad + f"while {_expr_src(stmt.expr, task_policy)}:")
+        guard_body = [
+            pad + "    _ae_guard += 1",
+            pad + f"    if _ae_guard > {max_iters}:",
+            pad + f"        rt.while_guard({max_iters})",
+            pad + "        break",
+        ]
+        out.extend(guard_body)
+        out.extend(render_inner(stmt.body, 1))
+    elif stmt.kind == "train":
+        out.append(
+            pad
+            + f"accuracy = rt.train({stmt.target}, {stmt.data}, epochs={stmt.epochs}).accuracy"
+        )
     elif stmt.kind == "if":
         out.append(pad + f"if {_expr_src(stmt.expr, task_policy)}:")
         out.extend(render_inner(stmt.body, 1))
@@ -187,10 +230,23 @@ def _stmt_src(
     return out
 
 
+def _iter_stmts(body: list[Stmt]):
+    for stmt in body:
+        yield stmt
+        if stmt.body:
+            yield from _iter_stmts(stmt.body)
+        if stmt.else_body:
+            yield from _iter_stmts(stmt.else_body)
+
+
 def _task_function(task: Task, source_lines: list[str]) -> list[str]:
     policy = _policy_from_modifier(task.modifier)
     lines = [f"    def task_{task.name}(rt):"]
     body: list[str] = []
+    # `accuracy` is the built-in training binding; tasks that reference it in a
+    # loop condition read it before the first train assignment.
+    if any(stmt.kind == "train" for stmt in _iter_stmts(task.body)):
+        body.append("        accuracy = 0.0")
     for stmt in task.body:
         body.extend(_stmt_src(stmt, policy, source_lines))
     if not body:
@@ -198,8 +254,23 @@ def _task_function(task: Task, source_lines: list[str]) -> list[str]:
     return lines + body
 
 
+def _fn_def(fn: Function, program: Program) -> list[str]:
+    lines = [f"def ae_fn_{fn.name}({', '.join(fn.params)}):"]
+    body: list[str] = []
+    for stmt in fn.body:
+        body.extend(_stmt_src(stmt, None, program.lines, depth=0, base=1))
+    if not body:
+        body.append("    pass")
+    default = {"float": "0.0", "int": "0", "bool": "False", "str": '""'}[fn.ret_type]
+    body.append(f"    return {default}  # fall-through guard")
+    return lines + body
+
+
 def generate(program: Program, source_name: str) -> str:
     """Return a Python module implementing the compiled task graph."""
+
+    _USER_FNS.clear()
+    _USER_FNS.update(fn.name for fn in program.functions)
 
     task_names = [task.name for task in program.tasks]
     plan = {
@@ -231,11 +302,20 @@ def generate(program: Program, source_name: str) -> str:
         f"PLAN = {plan!r}",
         "",
         "",
-        "def build(runtime):",
-        '    """Materialize the compiled Aether task graph."""',
-        "    tasks = {}",
-        "",
     ]
+
+    for fn in program.functions:
+        out.extend(_fn_def(fn, program))
+        out.append("")
+
+    out.extend(
+        [
+            "def build(runtime):",
+            '    """Materialize the compiled Aether task graph."""',
+            "    tasks = {}",
+            "",
+        ]
+    )
 
     for index, task in enumerate(program.tasks):
         out.extend(_task_function(task, program.lines))

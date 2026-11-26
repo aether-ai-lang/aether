@@ -1,0 +1,12 @@
+use ai.core
+use data.core
+use agent.core
+
+task RealDataPipeline:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    while accuracy < 0.9 max_iters(5):
+        train model on dataset(epochs: 2) -> self_heal
+    results = run model(dataset) -> stream_output
+    export model -> "v05_pipeline.ae.bin"
+    save_json(results, "report.json")

@@ -6,7 +6,7 @@ import difflib
 import re
 from dataclasses import dataclass
 
-from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary
+from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Program, Stmt, Task, Unary
 from .diagnostics import (
     Diagnostic,
     delete_line_patch,
@@ -15,8 +15,17 @@ from .diagnostics import (
     replace_span_patch,
 )
 
-ALLOWED_MODULES = {"ai.core", "web.core", "agent.core"}
-KNOWN_INTENTS = ("tensor", "load_data", "load_model", "neural_net", "classifier", "run")
+ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core"}
+KNOWN_INTENTS = (
+    "tensor",
+    "load_data",
+    "load_csv",
+    "load_model",
+    "neural_net",
+    "classifier",
+    "run",
+    "save_json",
+)
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
 MAX_ELEMENTS = 100_000_000
@@ -24,20 +33,23 @@ MAX_SAMPLES = 1_000_000
 MAX_CLASSES = 1_000
 MAX_PORT = 65535
 MAX_REPEAT = 1_000_000
+MAX_WHILE_ITERS = 100_000_000
 
 SIGNATURES = {
     "tensor": "tensor(rows, cols) -> auto_hardware",
     "load_data": "load_data(samples: N, features: D, classes: K?) -> auto_hardware",
+    "load_csv": 'load_csv("data.csv", target: "col") -> auto_hardware',
     "load_model": 'load_model("model.ae.bin") -> auto_hardware',
     "neural_net": "neural_net(in: X, out: Y, hidden: N?) -> optimize(speed: max|balanced|low)",
     "classifier": "classifier(in: D, classes: K, hidden: N?) -> optimize(speed: max|balanced|low)",
     "run": "run model(data) -> stream_output",
+    "save_json": 'save_json(value, "out.json")',
 }
 
 
 @dataclass
 class Ty:
-    kind: str  # tensor | dataset | model | stream | int | float | str | error
+    kind: str  # tensor | dataset | model | stream | int | float | str | bool | error
     shape: tuple[int, int] | None = None
     in_dim: int | None = None
     hidden: int | None = None
@@ -50,6 +62,7 @@ class Ty:
     trained: bool = False
     decl_line: int = 0
     decl_column: int = 0
+    source: str | None = None  # dataset origin: synthetic | csv path
 
 
 ERROR = Ty("error")
@@ -66,9 +79,12 @@ class Checker:
         self.core_avail = "ai.core" in self.uses
         self.web_avail = "web.core" in self.uses
         self.agent_avail = "agent.core" in self.uses
+        self.data_avail = "data.core" in self.uses
         self.reported_missing_core = False
         self.reported_missing_web = False
         self.reported_missing_agent = False
+        self.reported_missing_data = False
+        self.functions: dict[str, Function] = {f.name: f for f in program.functions}
 
     # ------------------------------------------------------------------ utils
     def error(
@@ -113,6 +129,8 @@ class Checker:
     # ------------------------------------------------------------- top level
     def check(self) -> list[Diagnostic]:
         self.check_uses()
+        for function in self.program.functions:
+            self.check_function(function)
         if not self.program.tasks:
             self.error(
                 "AE0501",
@@ -188,6 +206,12 @@ class Checker:
 
     # ------------------------------------------------------------------ tasks
     def check_task(self, task: Task) -> None:
+        scope: dict[str, Ty] = {}
+        # Built-in binding: once a task trains a model, `accuracy` holds the
+        # best validation accuracy seen so far (readable in while conditions).
+        if any(s.kind == "train" for s in self._iter_function_stmts(task.body)):
+            scope.setdefault("accuracy", Ty("float"))
+
         default_policy: dict | None = None
         if task.modifier is not None:
             if task.modifier.name != "optimize":
@@ -223,7 +247,6 @@ class Checker:
             )
             return
 
-        scope: dict[str, Ty] = {}
         for stmt in task.body:
             self.check_stmt(stmt, scope, default_policy)
 
@@ -233,7 +256,44 @@ class Checker:
         scope: dict[str, Ty],
         default_policy: dict | None,
         inside_block: bool = False,
+        inside_fn: bool = False,
     ) -> None:
+        if inside_fn and stmt.kind in ("assign", "expr", "return", "emit"):
+            callee = stmt.expr if isinstance(stmt.expr, Call) else None
+            if callee is not None and callee.name in KNOWN_INTENTS and callee.name not in self.functions:
+                self.error(
+                    "AE0210",
+                    f"intent '{callee.name}' cannot run inside a fn",
+                    stmt.line,
+                    stmt.column,
+                    hint="v0.5 functions are pure scalar computations; use intents in tasks.",
+                )
+                return
+            if callee is not None and callee.name not in self.functions and callee.name not in KNOWN_INTENTS:
+                self.error(
+                    "AE0211",
+                    f"Unknown function '{callee.name}'",
+                    stmt.line,
+                    stmt.column,
+                    hint="Declare it at top level: fn name(a, b) -> float: ...",
+                )
+                return
+            if stmt.kind in ("assign", "expr") and callee is None and not isinstance(
+                stmt.expr, (Binary, Unary, Literal, Name)
+            ):
+                self.error(
+                    "AE0210",
+                    "fn bodies compute scalars",
+                    stmt.line,
+                    stmt.column,
+                    hint="Use let/if/log/return with numbers, strings, and fn calls.",
+                )
+                return
+
+        if stmt.kind == "while":
+            self.check_while(stmt, scope, default_policy)
+            return
+
         if stmt.kind == "let":
             self.check_let(stmt, scope)
             return
@@ -459,7 +519,29 @@ class Checker:
             patch=insert_line_patch(self.path, self.lines, insert_at, "use agent.core"),
         )
 
+    def require_data_core(self, call: Call) -> None:
+        if self.data_avail or self.reported_missing_data:
+            return
+        self.reported_missing_data = True
+
+        if self.program.uses:
+            insert_at = max(u.line for u in self.program.uses) + 1
+        elif self.program.tasks:
+            insert_at = self.program.tasks[0].line
+        else:
+            insert_at = 1
+        self.error(
+            "AE0200",
+            "Missing 'use data.core' for data intents",
+            call.line,
+            call.column,
+            hint="Add 'use data.core' above the first task to use load_csv / save_json.",
+            patch=insert_line_patch(self.path, self.lines, insert_at, "use data.core"),
+        )
+
     def check_call(self, call: Call, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
+        if call.name in self.functions:
+            return self.check_fn_call(call, scope)
         if call.name not in KNOWN_INTENTS:
             suggestion = self._suggest(call.name, KNOWN_INTENTS)
             patch = None
@@ -485,12 +567,16 @@ class Checker:
             return self.check_tensor(call)
         if call.name == "load_data":
             return self.check_load_data(call)
+        if call.name == "load_csv":
+            return self.check_load_csv(call)
         if call.name == "load_model":
             return self.check_load_model(call)
         if call.name == "neural_net":
             return self.check_neural_net(call, scope, default_policy)
         if call.name == "classifier":
             return self.check_classifier(call, default_policy)
+        if call.name == "save_json":
+            return self.check_save_json(call, scope)
         return self.check_run(call, scope)
 
     # ------------------------------------------------------------ intent: tensor
@@ -684,6 +770,222 @@ class Checker:
             features=features,
             classes=classes,
         )
+
+    # ---------------------------------------------------------- intent: load_csv
+    def check_load_csv(self, call: Call) -> Ty:
+        self.require_data_core(call)
+        bound, _ = self.bind(call, [("path", True), ("target", True), ("classes", False)])
+
+        path = None
+        node = bound.get("path")
+        if isinstance(node, Literal) and isinstance(node.value, str):
+            path = node.value
+        elif node is not None:
+            self.error(
+                "AE0212",
+                "load_csv requires a quoted path",
+                getattr(node, "line", call.line),
+                getattr(node, "column", call.column),
+                hint='Example: load_csv("data/readings.csv", target: "fault")',
+            )
+
+        target = None
+        target_node = bound.get("target")
+        if isinstance(target_node, Literal) and isinstance(target_node.value, str):
+            target = target_node.value
+        elif target_node is not None or "target" in [a.name for a in call.args]:
+            bad = target_node or call.line
+            self.error(
+                "AE0212",
+                'load_csv target must be a quoted column name',
+                getattr(target_node, "line", call.line),
+                getattr(target_node, "column", call.column),
+                hint='Example: load_csv("data.csv", target: "label")',
+            )
+
+        if "auto_hardware" not in [m.name for m in call.modifiers]:
+            self.error(
+                "AE0300",
+                "load_csv(...) requires '-> auto_hardware'",
+                call.line,
+                call.column,
+                hint="Append '-> auto_hardware' so the compiler can bind a device.",
+                patch=self._append_modifier(call.line, "-> auto_hardware"),
+            )
+        for mod in call.modifiers:
+            if mod.name != "auto_hardware":
+                self.error(
+                    "AE0302",
+                    f"Unknown modifier '-> {mod.name}'",
+                    mod.line,
+                    mod.column,
+                    hint="Only '-> auto_hardware' is valid for load_csv().",
+                )
+            elif mod.args:
+                self.error(
+                    "AE0212",
+                    "auto_hardware takes no arguments",
+                    mod.args[0].line,
+                    mod.args[0].column,
+                    hint="Write '-> auto_hardware' without parentheses.",
+                )
+
+        if "classes" in bound:
+            parsed = self.int_arg(bound.get("classes"), "classes")
+            if parsed is not None and not 2 <= parsed <= MAX_CLASSES:
+                self.error(
+                    "AE0212",
+                    f"classes must be between 2 and {MAX_CLASSES}",
+                    call.line,
+                    call.column,
+                    hint="Class count is usually inferred from the target column.",
+                )
+
+        if path is None or target is None:
+            return ERROR
+        if not path or len(path) > 240:
+            self.error(
+                "AE0212",
+                "load_csv path must be a non-empty string under 240 characters",
+                call.line,
+                call.column,
+                hint='Example: load_csv("data/readings.csv", target: "fault")',
+            )
+            return ERROR
+
+        return Ty("dataset", source=path)
+
+    # --------------------------------------------------------- intent: save_json
+    def check_save_json(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_data_core(call)
+        bound, _ = self.bind(call, [("value", True), ("path", True)])
+
+        value = bound.get("value")
+        path_node = bound.get("path")
+        path = None
+        if isinstance(path_node, Literal) and isinstance(path_node.value, str):
+            path = path_node.value
+        elif path_node is not None:
+            self.error(
+                "AE0212",
+                "save_json path must be a quoted string",
+                getattr(path_node, "line", call.line),
+                getattr(path_node, "column", call.column),
+                hint='Example: save_json(results, "report.json")',
+            )
+
+        if value is not None:
+            if isinstance(value, Name):
+                ty = self.lookup(value, scope)
+                if ty.kind not in ("int", "float", "str", "bool", "stream", "model"):
+                    self.error(
+                        "AE0210",
+                        f"cannot serialize {self.article(ty.kind)}",
+                        value.line,
+                        value.column,
+                        hint="save_json takes scalars, streams (run results), or models.",
+                    )
+            elif isinstance(value, Literal):
+                if not isinstance(value.value, (int, float, str, bool)):
+                    self.error(
+                        "AE0210",
+                        "cannot serialize this literal",
+                        value.line,
+                        value.column,
+                        hint="save_json takes scalars, streams, or models.",
+                    )
+            else:
+                self.error(
+                    "AE0212",
+                    "save_json value must be a variable or scalar literal",
+                    getattr(value, "line", call.line),
+                    getattr(value, "column", call.column),
+                    hint="Example: save_json(results, \"report.json\")",
+                )
+
+        if path is None:
+            return ERROR
+        return Ty("int")
+
+    # ------------------------------------------------------------- fn functions
+    def check_fn_call(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        function = self.functions[call.name]
+        positional = [arg for arg in call.args if arg.name is None]
+        named = [arg for arg in call.args if arg.name is not None]
+        for arg in named:
+            self.error(
+                "AE0212",
+                f"function '{call.name}' takes positional arguments only",
+                arg.line,
+                arg.column,
+                hint=f"Signature: {call.name}({', '.join(function.params)})",
+            )
+        if len(positional) != len(function.params):
+            self.error(
+                "AE0212",
+                f"function '{call.name}' expects {len(function.params)} argument(s), got {len(positional)}",
+                call.line,
+                call.column,
+                hint=f"Signature: {call.name}({', '.join(function.params)})",
+            )
+        for arg in positional[: len(function.params)]:
+            ty = self.check_expr(arg.value, scope, {})
+            if ty.kind not in ("int", "float"):
+                self.error(
+                    "AE0210",
+                    f"function '{call.name}' parameters are numeric",
+                    arg.line,
+                    arg.column,
+                    hint=f"Pass numbers to {call.name}(...).",
+                )
+        if function.ret_type == "float":
+            return Ty("float")
+        return Ty(function.ret_type)
+
+    def check_function(self, function: Function) -> None:
+        scope: dict[str, Ty] = {
+            param: Ty("float") for param in function.params
+        }
+        for stmt in function.body:
+            self.check_stmt(stmt, scope, None, inside_block=True, inside_fn=True)
+
+        has_return = any(
+            stmt.kind == "return" for stmt in self._iter_function_stmts(function.body)
+        )
+        if not has_return:
+            self.error(
+                "AE0210",
+                f"fn '{function.name}' must return a {function.ret_type}",
+                function.line,
+                function.column,
+                hint="Add 'return <expression>' to the function body.",
+            )
+            return
+
+        for stmt in self._iter_function_stmts(function.body):
+            if stmt.kind == "return" and stmt.expr is not None:
+                ty = self.check_expr(stmt.expr, scope, {})
+                if ty.kind == "error":
+                    continue
+                expected = function.ret_type
+                ok = ty.kind == expected or (expected == "float" and ty.kind == "int")
+                if not ok:
+                    self.error(
+                        "AE0210",
+                        f"fn '{function.name}' returns {self.article(ty.kind)}, expected {self.article(expected)}",
+                        stmt.line,
+                        stmt.column,
+                        hint=f"Declared: fn {function.name}(...) -> {expected}:",
+                    )
+
+    @staticmethod
+    def _iter_function_stmts(body: list[Stmt]):
+        for stmt in body:
+            yield stmt
+            if stmt.body:
+                yield from Checker._iter_function_stmts(stmt.body)
+            if stmt.else_body:
+                yield from Checker._iter_function_stmts(stmt.else_body)
 
     # -------------------------------------------------------- intent: load_model
     def check_load_model(self, call: Call) -> Ty:
@@ -995,7 +1297,12 @@ class Checker:
                 )
 
         if model_ty is not None and dataset_ty is not None:
-            if model_ty.in_dim != dataset_ty.features:
+            # CSV-loaded datasets have unknown compile-time dims; the runtime
+            # validates them against the model at load time.
+            if model_ty.in_dim is None or dataset_ty.features is None:
+                model_ty.trained = True
+                scope.setdefault("accuracy", Ty("float"))
+            elif model_ty.in_dim != dataset_ty.features:
                 self.error(
                     "AE0210",
                     f"Feature mismatch: classifier expects {model_ty.in_dim}, dataset has {dataset_ty.features}",
@@ -1015,6 +1322,7 @@ class Checker:
                 )
             else:
                 model_ty.trained = True
+                scope.setdefault("accuracy", Ty("float"))
 
     # --------------------------------------------------------- statement: serve
     def check_serve(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
@@ -1119,7 +1427,9 @@ class Checker:
 
     # ------------------------------------------------- statements: v0.4 control flow
     def check_let(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
-        if not isinstance(stmt.expr, (Literal, Binary, Unary, Name)):
+        expr = stmt.expr
+        is_fn_call = isinstance(expr, Call) and expr.name in self.functions
+        if not isinstance(expr, (Literal, Binary, Unary, Name)) and not is_fn_call:
             self.error(
                 "AE0210",
                 f"'let {stmt.name}' binds a scalar; use plain assignment for intent results",
@@ -1129,7 +1439,7 @@ class Checker:
             )
             return
 
-        ty = self.check_expr(stmt.expr, scope, {})
+        ty = self.check_expr(expr, scope, {})
         if ty.kind not in ("int", "float", "str", "bool"):
             self.error(
                 "AE0210",
@@ -1151,6 +1461,30 @@ class Checker:
             )
             return
         scope[stmt.name or ""] = ty
+
+    def check_while(self, stmt: Stmt, scope: dict[str, Ty], default_policy: dict | None) -> None:
+        self.require_agent_core(stmt)
+
+        condition = self.check_expr(stmt.expr, scope, default_policy) if stmt.expr else ERROR
+        if condition.kind != "bool":
+            self.error(
+                "AE0210",
+                "while requires a comparison, e.g. accuracy < 0.9",
+                stmt.line,
+                stmt.column,
+                hint="Example: while accuracy < 0.9 max_iters(5):",
+            )
+        if stmt.max_iters is not None and not 1 <= stmt.max_iters <= MAX_WHILE_ITERS:
+            self.error(
+                "AE0212",
+                f"max_iters must be between 1 and {MAX_WHILE_ITERS:,}",
+                stmt.line,
+                stmt.column,
+                hint="The guard exists to stop runaway agent loops.",
+            )
+
+        for inner in stmt.body:
+            self.check_stmt(inner, scope, default_policy, inside_block=True)
 
     def check_repeat(self, stmt: Stmt, scope: dict[str, Ty], default_policy: dict | None) -> None:
         self.require_agent_core(stmt)
@@ -1476,7 +1810,12 @@ class Checker:
                 if data_ty.kind == "dataset"
                 else (data_ty.shape[1] if data_ty.shape else None)
             )
-            if model_ty.in_dim is not None and width is not None and width != model_ty.in_dim:
+            if (
+                model_ty.in_dim is not None
+                and width is not None
+                and data_ty.source is None
+                and width != model_ty.in_dim
+            ):
                 self.error(
                     "AE0210",
                     f"Input width mismatch: network expects {model_ty.in_dim}, data has {width}",

@@ -1,6 +1,9 @@
 ﻿use ai.core
 use agent.core
 
+fn score(x, y) -> float:
+    return x * x + y
+
 task Flow:
     let total = 0
     repeat 5 times:
@@ -10,3 +13,11 @@ task Flow:
     else:
         log "small"
     log total
+    log score(3, 4)
+    let ticks = 0
+    while ticks < 2 max_iters(10):
+        let ticks = ticks + 1
+    log ticks
+    while 1 == 1 max_iters(3):
+        log "spin"
+    log "done"

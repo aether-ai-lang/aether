@@ -459,35 +459,47 @@ def run_bench(args) -> int:
         )
 
     # ---- hand-written references --------------------------------------------
+    skip_refs = bool(os.environ.get("AETHER_BENCH_SKIP_REFERENCES"))
     numpy_tokens, numpy_lines = _python_metrics(ROOT / "benchmarks" / "reference_numpy.py")
-    try:
-        med = _median_row(
-            run_reference(
-                ROOT / "benchmarks" / "reference_numpy.py", workload, threads, repeat, None
-            )
-        )
+    if skip_refs:
         rows.append(
             Row(
                 name="python/numpy (hand-written)",
                 tokens=numpy_tokens,
                 lines=numpy_lines,
-                **med,
+                note="skipped (AETHER_BENCH_SKIP_REFERENCES)",
             )
         )
         baseline = rows[-1]
-    except Exception as exc:
-        rows.append(
-            Row(
-                name="python/numpy (hand-written)",
-                tokens=numpy_tokens,
-                lines=numpy_lines,
-                note=f"failed: {exc}",
+    else:
+        try:
+            med = _median_row(
+                run_reference(
+                    ROOT / "benchmarks" / "reference_numpy.py", workload, threads, repeat, None
+                )
             )
-        )
-        baseline = None
+            rows.append(
+                Row(
+                    name="python/numpy (hand-written)",
+                    tokens=numpy_tokens,
+                    lines=numpy_lines,
+                    **med,
+                )
+            )
+            baseline = rows[-1]
+        except Exception as exc:
+            rows.append(
+                Row(
+                    name="python/numpy (hand-written)",
+                    tokens=numpy_tokens,
+                    lines=numpy_lines,
+                    note=f"failed: {exc}",
+                )
+            )
+            baseline = None
 
     torch_path = _torch_pythonpath()
-    torch_available = torch_path is not None
+    torch_available = torch_path is not None and not skip_refs
     if torch_available:
         torch_tokens, torch_lines = _python_metrics(
             ROOT / "benchmarks" / "reference_torch.py"

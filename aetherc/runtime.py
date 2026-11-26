@@ -103,6 +103,8 @@ class TrainingResult:
 
 
 def detect_device() -> dict:
+    from .gpu import probe_gpu
+
     threads = int(os.environ.get("AETHER_THREADS") or (os.cpu_count() or 1))
     features: list[str] = []
     try:
@@ -122,6 +124,7 @@ def detect_device() -> dict:
     except Exception:
         pass
 
+    gpu = probe_gpu()
     return {
         "device": "cpu",
         "machine": platform.machine().lower() or "unknown",
@@ -129,6 +132,8 @@ def detect_device() -> dict:
         "threads": threads,
         "blas": blas,
         "dtype": "f32",
+        "gpu": gpu.get("name"),
+        "gpu_tier": gpu.get("tier", "cpu"),
     }
 
 
@@ -944,6 +949,114 @@ class Runtime:
         finally:
             server.server_close()
             self._emit_event("serve_stop", port=port, backend="python")
+
+    # ------------------------------------------------------------- data.core
+    def load_csv(self, path: str, target: str, classes: int | None = None) -> Dataset:
+        """Load a CSV file: numeric feature columns, one target column."""
+        import csv as _csv
+
+        source = Path(path)
+        if not source.is_absolute():
+            source = self.base_dir / source
+        with source.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = _csv.reader(handle)
+            try:
+                header = [column.strip() for column in next(reader)]
+            except StopIteration:
+                raise ValueError(f"{source} is empty") from None
+            if target not in header:
+                raise ValueError(
+                    f"target column '{target}' not in {source} header {header}"
+                )
+            target_index = header.index(target)
+            feature_indices = [i for i in range(len(header)) if i != target_index]
+            features = len(feature_indices)
+
+            rows: list[list[float]] = []
+            labels: list[str] = []
+            for record in reader:
+                if not record or all(not cell.strip() for cell in record):
+                    continue
+                try:
+                    rows.append(
+                        [float(record[i]) for i in feature_indices]
+                    )
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(
+                        f"{source} line {len(rows) + 2}: numeric features required"
+                    ) from exc
+                labels.append(record[target_index].strip())
+
+        label_ids = {label: index for index, label in enumerate(sorted(set(labels)))}
+        y = np.array([label_ids[label] for label in labels], dtype=np.int64)
+        X = np.array(rows, dtype=F32)
+        dataset = Dataset(
+            X=X,
+            y=y,
+            classes=len(label_ids),
+            samples=len(rows),
+            features=features,
+        )
+        self._emit_event(
+            "dataset",
+            samples=dataset.samples,
+            features=dataset.features,
+            classes=dataset.classes,
+            mib=dataset.mib,
+            source=str(source),
+        )
+        return dataset
+
+    def save_json(self, value: object, path: str) -> int:
+        import json as _json
+
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(value, StreamResult):
+            payload: dict = {
+                "rows": value.rows,
+                "out_dim": value.out_dim,
+                "chunks": value.chunks,
+                "accuracy": value.accuracy,
+                "loss": value.loss,
+                "gflops": value.gflops,
+                "checksum": value.checksum,
+                "digest": value.digest,
+            }
+        elif isinstance(value, Model):
+            payload = {
+                "kind": value.model_kind,
+                "in_dim": value.in_dim,
+                "hidden": value.hidden,
+                "out_dim": value.out_dim,
+                "classes": value.classes,
+                "params": value.params,
+                "trained": value.trained,
+            }
+        elif isinstance(value, bool):
+            payload = {"value": value}
+        elif isinstance(value, (int, float)):
+            payload = {"value": float(value)}
+        elif isinstance(value, str):
+            payload = {"value": value}
+        else:
+            raise TypeError("save_json takes scalars, streams, or models")
+
+        data = _json.dumps(payload, indent=2)
+        target.write_text(data + "\n", encoding="utf-8", newline="\n")
+        size = target.stat().st_size
+        self._emit_event("save_json", path=str(target), bytes=size)
+        return size
+
+    def while_guard(self, max_iters: int) -> None:
+        self._emit_event(
+            "while_guard",
+            max_iters=int(max_iters),
+            message=f"while loop hit max_iters({int(max_iters)}); exiting",
+        )
 
     # ------------------------------------------------------------------- logs
     def log(self, value: object) -> None:

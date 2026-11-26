@@ -6,19 +6,37 @@
 
 You declare **what** the AI workload is. Aether decides **how** to run it — and emits
 standalone, multi-threaded **C99 machine code**: training jobs, streaming inference,
-native HTTP/JSON model servers, and — as of v0.4 — **real control flow**. The
-language is now Turing-complete, and your agent drives everything over **MCP**.
+native HTTP servers, GPU dispatch, and real CSV→model→JSON pipelines. The language is
+Turing-complete with `while` loops and user functions, and your agent drives
+everything over **MCP**.
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
-![turing](https://img.shields.io/badge/language-Turing--complete%20%28v0.4%29-blueviolet)
+![gpu](https://img.shields.io/badge/GPU-auto%20dispatch%20%28CUDA%20%3E%20C99%20%3E%20Python%29-blueviolet)
+![turing](https://img.shields.io/badge/language-Turing--complete-blueviolet)
 ![blas](https://img.shields.io/badge/BLAS-OpenBLAS%20%7C%20blocked--sgemm-red)
 ![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
 ![python](https://img.shields.io/badge/python%20fallback-3.10%2B-informational)
-![tests](https://img.shields.io/badge/tests-30%2F30-brightgreen)
+![tests](https://img.shields.io/badge/tests-33%2F33-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
-**Train a classifier. Export the weights. Serve them as a JSON API. Four lines.**
+**Load real CSV data. Train in a convergence loop. Export model + JSON report.
+Nine lines, zero Python at runtime.**
+
+```aether
+use ai.core
+use data.core
+use agent.core
+
+task RealDataPipeline:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    while accuracy < 0.9 max_iters(5):
+        train model on dataset(epochs: 2) -> self_heal
+    results = run model(dataset) -> stream_output
+    export model -> "v05_pipeline.ae.bin"
+    save_json(results, "report.json")
+```
 
 ```aether
 use ai.core
@@ -32,6 +50,29 @@ task ServeAI:
 </div>
 
 ---
+
+## v0.5 — GPU Dispatch, Real Data, Guarded Loops
+
+- **`auto_hardware` now probes for GPUs** — `wmic` + `nvidia-smi -L` detect NVIDIA /
+  AMD / Intel hardware and `nvcc` availability. `--target=cuda` emits a real CUDA
+  kernel plan (compiled by nvcc) when a GPU + toolkit exist; otherwise Aether falls
+  back to the AVX-512/OpenBLAS C99 path **and says so** in the `[device]` telemetry
+  and JSON `note` — it never fakes GPU execution.
+- **`data.core`** — `load_csv("path.csv", target: "col")` parses real CSV files
+  (numeric features, string-label interning, runtime shape discovery) and
+  `save_json(value, "path.json")` writes strict JSON — both compiled to native C99
+  file I/O with zero Python dependencies.
+- **`while cond max_iters(N):`** — conditional loops with a built-in infinite-loop
+  guard that emits a `while_guard` event instead of hanging your agent. Plus the
+  built-in **`accuracy`** binding: after `train`, the best validation accuracy is
+  readable in the loop condition.
+- **`fn name(a, b) -> float:`** — reusable functions with typed returns, compiled to
+  static C functions (or nested Python defs), with arity/type checking at compile
+  time.
+
+Measured live on the native binary (`examples/real_data_pipeline.ae`, 480-row CSV):
+the `while` loop converges **0.833 → 0.867 → 0.904** accuracy and exits *before*
+its guard, then writes `report.json` from pure C — whole pipeline **8.3 ms**.
 
 ## v0.4 — Turing-Complete Aether
 
@@ -114,8 +155,11 @@ cd aether
 # automatically if no C compiler is installed)
 python aether.py run hello_aether.ae
 
-# loops, branches, arithmetic — compiled to C
+# loops, branches, arithmetic, user functions — compiled to C
 python aether.py run examples/control_flow.ae
+
+# real CSV -> convergence loop -> native JSON report
+python aether.py run examples/real_data_pipeline.ae
 
 # an autonomous agent that retrains itself in a loop
 python aether.py run examples/autonomous_loop.ae
@@ -297,20 +341,19 @@ block by design — `aether run` *is* the server; Ctrl+C stops it.
 
 ## Backends
 
-| | `--target=c` (default) | `--target=python` |
-|---|---|---|
-| Artifact | `.aether_build/<name>.c` → `.exe` | `.aether_build/<name>.py` |
-| Runtime deps | libc + OpenMP + Winsock2/POSIX sockets (+ OpenBLAS if found) | NumPy + stdlib |
-| Threading | OpenMP + adaptive BLAS pool + thread-per-connection | OpenBLAS + threaded HTTP |
-| Streaming | native, live per-chunk output | live per-chunk output |
-| Training | SGD+momentum, self-healing guards | same semantics |
-| HTTP serving | native C99 JSON API | identical API, stdlib server |
-| Model format | AEB1 (identical bytes) | AEB1 (identical bytes) |
+| | `--target=cuda` | `--target=c` (default) | `--target=python` |
+|---|---|---|---|
+| Requires | NVIDIA GPU + nvcc | any C compiler | Python 3.10+ |
+| Artifact | `<name>.cu` → nvcc binary | `<name>.c` → `.exe` | `<name>.py` |
+| Runtime deps | CUDA runtime | libc + OpenMP + sockets (+ OpenBLAS) | NumPy + stdlib |
+| Threading | CUDA kernels | OpenMP + adaptive BLAS pool + thread-per-connection | OpenBLAS + threaded HTTP |
+| Fallback | → C99 (with an explicit note) | → Python (with an explicit note) | — |
 
 Aether finds gcc/clang/MSVC via `PATH`, `$AETHER_CC`, or a portable toolchain at
 `%LOCALAPPDATA%\Aether\toolchain\w64devkit`; OpenBLAS via `$AETHER_OPENBLAS` or
-`%LOCALAPPDATA%\Aether\toolchain\openblas`. With no compiler at all, everything
-still runs on the Python backend — same language, same diagnostics, same results.
+`%LOCALAPPDATA%\Aether\toolchain\openblas`; GPUs via `wmic`/`nvidia-smi`/`nvcc`.
+With no compiler at all, everything still runs on the Python backend — same
+language, same diagnostics, same results.
 
 ## Repository layout
 
@@ -318,19 +361,22 @@ still runs on the Python backend — same language, same diagnostics, same resul
 AETHER_SPEC.md               language specification (grammar, intents, error contract)
 aether.py / aether.cmd       CLI entrypoints
 aetherc/                     the compiler
-  lexer.py parser.py ast_nodes.py    front end (indentation-aware, 4-space blocks)
+  lexer.py parser.py ast_nodes.py    front end (blocks, expressions, functions)
   checker.py diagnostics.py          type rules + fix_patch synthesis + patch application
+  gpu.py                             GPU/CUDA probing and target dispatch
   codegen.py                         Python/NumPy backend
-  cbackend.py                        C99 backend: OpenMP, OpenBLAS, HTTP server
+  cbackend.py                        C99 backend: OpenMP, OpenBLAS, HTTP, CSV/JSON I/O
   runtime.py                         NumPy runtime (devices, training, streaming, serving)
   mcp.py                             MCP server (JSON-RPC over stdio)
   bench.py bench/                    benchmark orchestration + hand-written references
 hello_aether.ae              5-line inference demo
 examples/train_ai_agent.ae   the training demo used by `aether bench`
 examples/serve_ai_api.ae     the 4-line HTTP serving demo
-examples/control_flow.ae     loops, branches, arithmetic on both backends
-examples/autonomous_loop.ae  self-retraining agent pipeline (v0.4)
+examples/control_flow.ae     loops, branches, arithmetic, fn, while guards
+examples/real_data_pipeline.ae  CSV -> while convergence -> native JSON report
+examples/autonomous_loop.ae  self-retraining agent pipeline
 examples/self_heal.ae        intentionally broken file for the healing demo
+examples/data/readings.csv   480-row sample dataset for data.core
 tests/test_aether.py         end-to-end tests (both backends, HTTP, MCP, control flow)
 ```
 
@@ -342,18 +388,19 @@ python -m unittest discover -s tests -v
 
 End-to-end coverage: compile and run on **both** backends, standalone-C emission,
 training + AEB1 export parity, **live HTTP inference against the compiled native
-server and the Python server**, MCP initialize/tools/fix/compile/spec flows, patch
-application, control-flow semantics (loops, branches, arithmetic) on both backends,
-JSON contracts, bench output, and applying the combined self-heal patch with
-`git apply`.
+server and the Python server**, **real CSV ingestion + while convergence + native
+JSON output on both backends**, GPU probe/CUDA fallback behavior, MCP
+initialize/tools/fix/compile/spec flows, patch application, control-flow semantics
+(loops, branches, arithmetic, fn, guards) on both backends, JSON contracts, bench
+output, and applying the combined self-heal patch with `git apply`.
 
-## Roadmap (v0.5+)
+## Roadmap (v0.6+)
 
-- `while` loops and comparisons over tensors (tensor reductions as intents)
-- GPU backend behind `auto_hardware` (the binding is already the language contract)
+- Real CUDA training (kernels for SGD backward passes, not just inference)
+- AMD ROCm / OpenCL dispatch tiers behind `auto_hardware`
+- Tensor arithmetic + reductions as intents (`mean`, `sum`, slicing)
 - HTTPS/TLS and streaming (chunked) responses in `web.core`
-- More intent packs (`agent.core`: memory, tools, planning intents)
-- Deterministic cross-backend parity tests (bit-identical digests)
+- `agent.core` planning intents: memory, tool calls, multi-step reasoning
 
 ## License
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ast_nodes import Arg, Binary, Call, Literal, Modifier, Name, Program, Stmt, Task, Unary, Use
+from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Program, Stmt, Task, Unary, Use
 from .diagnostics import AetherError, replace_line_patch
 from .lexer import Token
 
@@ -70,6 +70,7 @@ class Parser:
     def parse_program(self) -> Program:
         uses: list[Use] = []
         tasks: list[Task] = []
+        functions: list[Function] = []
 
         while not self.at("EOF"):
             if self.at("NEWLINE"):
@@ -82,7 +83,7 @@ class Parser:
                     token.line,
                     token.column,
                     code="AE0100",
-                    hint="Top-level statements must be 'use ...' or 'task ...' with no leading spaces.",
+                    hint="Top-level declarations must be 'use ...', 'fn ...', or 'task ...'.",
                 )
             if self.at_keyword("use"):
                 uses.append(self.parse_use())
@@ -90,17 +91,27 @@ class Parser:
             if self.at_keyword("task"):
                 tasks.append(self.parse_task())
                 continue
+            if self.at_keyword("fn"):
+                functions.append(self.parse_fn())
+                continue
 
             token = self.peek()
             raise AetherError(
-                f"Expected 'use' or 'task', found {self.describe(token)}",
+                f"Expected 'use', 'fn', or 'task', found {self.describe(token)}",
                 token.line,
                 token.column,
                 code="AE0100",
-                hint="A program is a sequence of 'use ai.core' and 'task <Name>:' declarations.",
+                hint="A program is a sequence of 'use ...', 'fn ...', and 'task <Name>:' declarations.",
             )
 
-        return Program(uses=uses, tasks=tasks, path=self.path, source=self.source, lines=self.lines)
+        return Program(
+            uses=uses,
+            tasks=tasks,
+            path=self.path,
+            source=self.source,
+            lines=self.lines,
+            functions=functions,
+        )
 
     def parse_use(self) -> Use:
         start = self.expect("IDENT", "use")
@@ -187,10 +198,21 @@ class Parser:
             return self.parse_let()
         if self.at_keyword("repeat"):
             return self.parse_repeat()
+        if self.at_keyword("while"):
+            return self.parse_while()
         if self.at_keyword("if"):
             return self.parse_if()
         if self.at_keyword("log"):
             return self.parse_log()
+        if self.at_keyword("fn"):
+            token = self.peek()
+            raise AetherError(
+                "'fn' must be declared at top level",
+                token.line,
+                token.column,
+                code="AE0100",
+                hint="Move 'fn name(...):' above the task, beside 'use' and 'task'.",
+            )
 
         if self.at_keyword("emit") or self.at_keyword("return"):
             kind = "emit" if token.value == "emit" else "return"
@@ -266,6 +288,79 @@ class Parser:
             column=start.column,
             count=count,
             body=body,
+        )
+
+    def parse_while(self) -> Stmt:
+        start = self.expect("IDENT", "while")
+        condition = self.parse_expr()
+
+        max_iters = 100_000
+        if self.at_keyword("max_iters"):
+            self.advance()
+            self.expect("PUNCT", "(", hint="Use: max_iters(1000)")
+            number = self.expect(
+                "NUMBER", hint="max_iters takes an integer literal, e.g. max_iters(1000)."
+            )
+            if not isinstance(number.value, int):
+                raise AetherError(
+                    "max_iters must be an integer",
+                    number.line,
+                    number.column,
+                    code="AE0212",
+                    hint="Use a whole number such as max_iters(1000).",
+                )
+            max_iters = int(number.value)
+            self.expect("PUNCT", ")")
+
+        self.expect("PUNCT", ":", hint="A colon ends the while header, then indent the body.")
+        self.expect("NEWLINE")
+        body = self.parse_indented_block("while body")
+        return Stmt(
+            kind="while",
+            expr=condition,
+            line=start.line,
+            column=start.column,
+            max_iters=max_iters,
+            body=body,
+        )
+
+    def parse_fn(self) -> Function:
+        start = self.expect("IDENT", "fn")
+        name = self.expect("IDENT", hint="Example: fn score(x, y) -> float:")
+        self.expect("PUNCT", "(", hint="Parameter list opens with '('.")
+        params: list[str] = []
+        if not self.at("PUNCT", ")"):
+            while True:
+                param = self.expect("IDENT", hint="Parameters are plain names: fn add(a, b).")
+                params.append(str(param.value))
+                if self.at("PUNCT", ","):
+                    self.advance()
+                    continue
+                break
+        self.expect("PUNCT", ")", hint="Close the parameter list with ')'.")
+        self.expect(
+            "ARROW", hint="Functions declare a return type: fn add(a, b) -> float:"
+        )
+        ret_token = self.expect("IDENT", hint="Return types: int | float | bool | str")
+        ret_type = str(ret_token.value)
+        if ret_type not in ("int", "float", "bool", "str"):
+            raise AetherError(
+                f"Unknown return type '{ret_type}'",
+                ret_token.line,
+                ret_token.column,
+                code="AE0212",
+                hint="Return types: int | float | bool | str",
+            )
+        self.expect("PUNCT", ":", hint="A colon ends the fn header, then indent the body.")
+        self.expect("NEWLINE")
+        body = self.parse_indented_block("fn body")
+        return Function(
+            name=str(name.value),
+            params=params,
+            ret_type=ret_type,
+            body=body,
+            line=start.line,
+            column=start.column,
         )
 
     def parse_if(self) -> Stmt:

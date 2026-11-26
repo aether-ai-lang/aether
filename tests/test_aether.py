@@ -313,10 +313,16 @@ class AetherCliTests(unittest.TestCase):
     def test_bench_reports_comparison(self) -> None:
         from aetherc.cbackend import find_toolchain
 
-        # Skip the (multi-second) PyTorch reference in unit tests: point the
-        # bench at a directory that has no torch install.
+        # Fast mode for unit tests: skip the (multi-second) hand-written
+        # reference implementations; production bench still runs them.
         args = ["bench", "examples/train_ai_agent.ae", "--repeat", "1", "--json"]
-        result = run_cli(*args, env={"AETHER_TORCH_PATH": "skipped-for-tests"})
+        result = run_cli(
+            *args,
+            env={
+                "AETHER_TORCH_PATH": "skipped-for-tests",
+                "AETHER_BENCH_SKIP_REFERENCES": "1",
+            },
+        )
         self.assertEqual(result.returncode, 0, result.stdout[-3000:])
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
@@ -364,7 +370,13 @@ class AetherCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout[-1500:])
         payload = json.loads(result.stdout)
         self.assertEqual(payload["target"], "python")
-        self.assertEqual(self._flow_logs(payload), ["big", "10"])
+        self.assertEqual(
+            self._flow_logs(payload),
+            ["big", "10", "13", "2", "spin", "spin", "spin", "done"],
+        )
+        guards = [e for e in payload["events"] if e["event"] == "while_guard"]
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0]["max_iters"], 3)
 
     def test_control_flow_native(self) -> None:
         from aetherc.cbackend import find_toolchain
@@ -375,7 +387,12 @@ class AetherCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout[-1500:])
         payload = json.loads(result.stdout)
         self.assertEqual(payload["target"], "c")
-        self.assertEqual(self._flow_logs(payload), ["big", "10"])
+        self.assertEqual(
+            self._flow_logs(payload),
+            ["big", "10", "13", "2", "spin", "spin", "spin", "done"],
+        )
+        guards = [e for e in payload["events"] if e["event"] == "while_guard"]
+        self.assertEqual(len(guards), 1)
 
     def test_autonomous_loop_runs(self) -> None:
         from aetherc.cbackend import find_toolchain
@@ -431,6 +448,114 @@ class AetherCliTests(unittest.TestCase):
                 any(expected in d["message"] for d in payload["diagnostics"]),
                 (body, payload["diagnostics"]),
             )
+
+    # ------------------------------------------------------------------ v0.5
+    def test_real_data_pipeline(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
+        cls = type(self)
+        cls._ensure_serve_model  # keep linter quiet about optional ordering
+
+        result = run_cli(
+            "run", "examples/real_data_pipeline.ae", "--target", "python", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        events = payload["events"]
+        datasets = [e for e in events if e["event"] == "dataset"]
+        self.assertEqual(len(datasets), 1)
+        self.assertEqual((datasets[0]["samples"], datasets[0]["features"]), (480, 8))
+        self.assertEqual(
+            len([e for e in events if e["event"] == "train_done"]), 3,
+            "while loop should converge after 3 training rounds",
+        )
+        self.assertEqual(
+            len([e for e in events if e["event"] == "while_guard"]), 0,
+            "the guard should not trip on a converging loop",
+        )
+        saves = [e for e in events if e["event"] == "save_json"]
+        self.assertTrue(saves)
+        report = pathlib.Path(saves[0]["path"])
+        self.assertTrue(report.is_file())
+        report_data = json.loads(report.read_text(encoding="utf-8"))
+        self.assertGreater(report_data["accuracy"], 0.85)
+
+        if find_toolchain() is None:
+            return
+        result = run_cli(
+            "run", "examples/real_data_pipeline.ae", "--target", "c", "--json"
+        )
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        events = payload["events"]
+        self.assertEqual(
+            len([e for e in events if e["event"] == "train_done"]), 3
+        )
+        saves = [e for e in events if e["event"] == "save_json"]
+        self.assertTrue(saves)
+        report_data = json.loads(pathlib.Path(saves[0]["path"]).read_text(encoding="utf-8"))
+        self.assertGreater(report_data["accuracy"], 0.85)
+        self.assertIn("digest", report_data)
+
+    def test_gpu_dispatch_and_cuda_fallback(self) -> None:
+        from aetherc.gpu import dispatch_target, probe_gpu
+
+        info = probe_gpu()
+        self.assertIn("tier", info)
+        self.assertIn("vendor", info)
+
+        resolved, _note = dispatch_target("auto")
+        self.assertIn(resolved, ("cuda", "c"))
+
+        # This machine (and CI) may or may not have nvcc; requesting CUDA must
+        # never silently fake GPU execution: it dispatches or says why.
+        result = run_cli("run", "hello_aether.ae", "--target", "cuda", "--json")
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        if probe_gpu()["cuda_gpu"] and probe_gpu()["nvcc"]:
+            self.assertEqual(payload["target"], "cuda")
+        else:
+            self.assertEqual(payload["target"], "c")
+            self.assertIn("nvcc", payload.get("note") or "nvcc")
+
+    def test_data_core_contracts(self) -> None:
+        path = write_temp(
+            "use ai.core\nuse data.core\n\ntask Needs:\n"
+            '    dataset = load_csv("data.csv") -> auto_hardware\n'
+            "    model = classifier(in: 4, classes: 2) -> optimize(speed: max)\n"
+            '    save_json(12345, "out.json")\n'
+        )
+        payload = json.loads(run_cli("check", str(path)).stdout)
+        self.assertEqual(payload["status"], "error")
+        missing_target = next(
+            (d for d in payload["diagnostics"] if d["code"] == "AE0212"), None
+        )
+        self.assertIsNotNone(missing_target)
+        self.assertIn("target", missing_target["message"].lower())
+
+        nomod = write_temp(
+            "use ai.core\n\ntask NoData:\n"
+            '    dataset = load_csv("data.csv", target: "y") -> auto_hardware\n'
+        )
+        payload = json.loads(run_cli("check", str(nomod)).stdout)
+        self.assertTrue(
+            any(
+                d["code"] == "AE0200" and "data.core" in d["message"]
+                for d in payload["diagnostics"]
+            ),
+            payload["diagnostics"],
+        )
+        self.assertIn("use data.core", payload["fix_patch"])
+
+        fnbad = write_temp(
+            "use ai.core\nuse agent.core\n\nfn add(a, b) -> float:\n    return a + b\n\n"
+            "task Calls:\n    let value = add(1)\n"
+        )
+        payload = json.loads(run_cli("check", str(fnbad)).stdout)
+        self.assertTrue(
+            any("expects 2 argument(s)" in d["message"] for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
 
     # ------------------------------------------------------------------ v0.3
     def test_serve_requires_web_core_and_route(self) -> None:
@@ -703,7 +828,7 @@ class AetherCliTests(unittest.TestCase):
                 }
             )
             self.assertEqual(init["result"]["serverInfo"]["name"], "aether")
-            self.assertEqual(init["result"]["serverInfo"]["version"], "0.4")
+            self.assertEqual(init["result"]["serverInfo"]["version"], "0.5")
             notify({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
             tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})

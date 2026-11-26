@@ -194,17 +194,24 @@ def make_printer(ui: UI):
     def printer(event: dict) -> None:
         kind = event["event"]
         if kind == "device":
+            gpu_part = (
+                f" | gpu: {event['gpu']} ({event.get('gpu_tier', 'cpu')})"
+                if event.get("gpu")
+                else " | gpu: none detected (cpu tier)"
+            )
             if event.get("backend") == "c":
                 print(
                     f"  [device] auto_hardware -> {event['device']}/native | "
                     f"{event['threads']} threads | {event.get('compiler', 'c')} | "
                     f"{event.get('blas', 'sgemm')} | {event['dtype']}"
+                    f"{gpu_part}"
                 )
             else:
                 features = "+".join(event["features"]) or "baseline"
                 print(
                     f"  [device] auto_hardware -> {event['device']}/{event['machine']} | "
-                    f"{features} | {event['threads']} threads | {event['blas']} | {event['dtype']}"
+                    f"{features} | {event['threads']} threads | {event['blas']} | "
+                    f"{event['dtype']}{gpu_part}"
                 )
         elif kind == "tensor":
             print(
@@ -212,9 +219,14 @@ def make_printer(ui: UI):
                 f"normal(seed=0x{event.get('seed', 0xAE7E):X})"
             )
         elif kind == "dataset":
+            origin = (
+                f" | from {Path(event['source']).name}"
+                if event.get("source")
+                else " | synthetic"
+            )
             print(
                 f"  [dataset] {event['samples']:,} samples x {event['features']} features | "
-                f"{event['classes']} classes | {event['mib']:.2f} MiB | synthetic"
+                f"{event['classes']} classes | {event['mib']:.2f} MiB{origin}"
             )
         elif kind == "model":
             label = "model" if event.get("kind") == "classifier" else "net"
@@ -241,6 +253,12 @@ def make_printer(ui: UI):
             print(
                 f"  [heal]   epoch {event.get('epoch', '?')} | {event['reason']} | "
                 f"lr -> {event.get('lr', 0):g}"
+            )
+        elif kind == "while_guard":
+            print(f"  [guard]  {event.get('message', 'loop guard tripped')}")
+        elif kind == "save_json":
+            print(
+                f"  [json]   {Path(event['path']).name} | {event['bytes']} bytes"
             )
         elif kind == "train_done":
             print(
@@ -370,7 +388,16 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 1
 
     target = getattr(args, "target", "python") or "python"
+    note = None
+    if target in ("c", "auto", "cuda"):
+        from .gpu import dispatch_target
+
+        resolved, note = dispatch_target(target)
+        target = resolved
+
     toolchain = None
+    if target == "cuda":
+        return _run_cuda(args, path, result, program, task_name, warnings, ui, note)
     if target in ("c", "auto"):
         from .cbackend import CBackendError, find_toolchain
 
@@ -389,6 +416,13 @@ def cmd_run(args: argparse.Namespace) -> int:
                 return 2
             toolchain = None
 
+    if note and not json_mode:
+        print(f"  {ui.paint(YELLOW, '[note]   ' + note)}")
+
+    from .gpu import probe_gpu
+
+    os.environ.setdefault("AETHER_DEVICE_TIER", str(probe_gpu().get("tier") or "cpu"))
+
     use_native = toolchain is not None and target in ("c", "auto")
     if not json_mode:
         print(f"{ui.paint(BOLD, 'aether')} {AETHER_VERSION}  {ui.paint(DIM, '|')}  {path.name}")
@@ -402,7 +436,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
 
     if use_native:
-        return _run_native(args, path, result, program, task_name, warnings, ui, toolchain)
+        return _run_native(args, path, result, program, task_name, warnings, ui, toolchain, note)
 
     if target == "c" and not json_mode:
         print_human_diagnostics(
@@ -502,6 +536,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "file": str(path),
             "task": task_name,
             "target": "python",
+            "note": note,
             "compile": {
                 "tokens": result["tokens"],
                 "parse_ms": result["parse_ms"],
@@ -522,6 +557,113 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_cuda(
+    args: argparse.Namespace,
+    path: Path,
+    result: dict,
+    program,
+    task_name: str,
+    warnings: list[Diagnostic],
+    ui: UI,
+    note: str | None,
+) -> int:
+    """Compile and run the CUDA plan; never silently fakes GPU execution."""
+    from .cbackend import CBackendError, compile_cuda, generate_cuda, run_binary
+    from .gpu import probe_gpu
+
+    json_mode = args.json
+    if not json_mode:
+        print(f"{ui.paint(BOLD, 'aether')} {AETHER_VERSION}  {ui.paint(DIM, '|')}  {path.name}")
+        print()
+        print(f"  {'parse':<7} {result['parse_ms']:6.2f} ms   {result['tokens']} tokens")
+        gpu = probe_gpu()
+        print(
+            f"  {'device':<7} cuda | {gpu.get('name') or 'NVIDIA GPU'} | "
+            f"nvcc: {gpu.get('nvcc')}"
+        )
+        if note:
+            print(f"  {ui.paint(YELLOW, '[note]   ' + note)}")
+
+    try:
+        source = generate_cuda(program, path.name)
+        out_dir = Path(args.build_dir) if args.build_dir else path.parent / ".aether_build"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if args.emit_only:
+            cu_file = out_dir / f"{path.stem}.cu"
+            cu_file.write_text(source, encoding="utf-8", newline="\n")
+            if json_mode:
+                print_json(
+                    {
+                        "status": "ok",
+                        "aether": AETHER_VERSION,
+                        "file": str(path),
+                        "target": "cuda",
+                        "artifact": str(cu_file),
+                    }
+                )
+            else:
+                print(f"  emitted -> {display_path(cu_file)}")
+            return 0
+        binary, compile_ms, _command = compile_cuda(source, out_dir, path.stem)
+    except CBackendError as exc:
+        payload = {
+            "status": "error",
+            "code": "AE9003",
+            "message": f"CUDA backend unavailable: {exc}",
+            "hint": "Install the CUDA toolkit (nvcc) and a CUDA-capable GPU, "
+            "or run with --target=c / --target=python.",
+        }
+        print_json(payload)
+        return 1
+
+    if args.emit_only:
+        return 0
+
+    if json_mode:
+        started = time.perf_counter()
+        proc = run_binary(binary, task_name, events=True, silent=True, base_dir=str(path.parent.resolve()))
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        events = parse_events(proc.stderr)
+        if proc.returncode != 0:
+            print_json(
+                {
+                    "status": "error",
+                    "code": "AE9000",
+                    "message": f"CUDA task '{task_name}' failed with exit code {proc.returncode}",
+                }
+            )
+            return 3
+        print_json(
+            {
+                "status": "ok",
+                "aether": AETHER_VERSION,
+                "file": str(path),
+                "task": task_name,
+                "target": "cuda",
+                "events": events,
+                "elapsed_ms": wall_ms,
+            }
+        )
+        return 0
+
+    started = time.perf_counter()
+    sys.stdout.flush()
+    proc = run_binary(binary, task_name, events=False, silent=False, inherit=True, base_dir=str(path.parent.resolve()))
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    print()
+    if proc.returncode != 0:
+        print_json(
+            {
+                "status": "error",
+                "code": "AE9000",
+                "message": f"CUDA task '{task_name}' failed with exit code {proc.returncode}",
+            }
+        )
+        return 3
+    print(f"  {ui.paint(DIM, f'{wall_ms:.1f} ms wall (cuda)')}")
+    return 0
+
+
 def _run_native(
     args: argparse.Namespace,
     path: Path,
@@ -531,6 +673,7 @@ def _run_native(
     warnings: list[Diagnostic],
     ui: UI,
     toolchain,
+    note: str | None = None,
 ) -> int:
     from .cbackend import (
         CBackendError,
@@ -637,6 +780,7 @@ def _run_native(
             "file": str(path),
             "task": task_name,
             "target": "c",
+            "note": note,
             "compile": {
                 "tokens": result["tokens"],
                 "parse_ms": result["parse_ms"],
@@ -693,8 +837,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
         description=(
-            "Aether 0.4 - intent-driven AI-agent-native compiler "
-            "(Turing-complete, native C99 + Python backends, HTTP serving, MCP)"
+            "Aether 0.5 - intent-driven AI-agent-native compiler "
+            "(GPU dispatch, data.core, while loops, fn, native C99 + Python backends)"
         ),
     )
     parser.add_argument(
@@ -710,9 +854,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--target",
-        choices=("auto", "c", "python"),
+        choices=("auto", "c", "cuda", "python"),
         default="auto",
-        help="execution backend: native C when a compiler is found (default), or Python",
+        help=(
+            "execution backend: auto-dispatch to CUDA when a GPU + nvcc exist, "
+            "else native C (default), else Python"
+        ),
     )
     run_parser.add_argument("--cc", help="path to the C compiler for --target=c")
     run_parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")

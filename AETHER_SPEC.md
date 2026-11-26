@@ -1,14 +1,14 @@
-# Aether (.ae) — Language Specification v0.4
+# Aether (.ae) — Language Specification v0.5
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
 training run, a stream, an HTTP endpoint); the compiler decides *how* (device, dtype,
-fusion, buffering, threading, even the BLAS thread pool). v0.4 makes the language
-**Turing-complete**: scalars, arithmetic, comparisons, `repeat` loops, and `if/else`
-branches compile to the same **standalone, multi-threaded C** (`--target=c`, the
-default when a C compiler is present — zero Python at runtime) or to optimized
-NumPy/OpenBLAS Python. Trained models can be served over HTTP as a **native C99
-JSON API**, and `aether mcp` exposes the whole toolchain to AI agents over the
-Model Context Protocol.
+fusion, buffering, threading, even the BLAS thread pool). v0.5 adds **GPU dispatch**
+(`auto_hardware` probes NVIDIA/AMD/Intel hardware and `--target=cuda` compiles CUDA
+kernels when a GPU + nvcc exist), **real data ingestion** (`data.core`: CSV in,
+JSON out, compiled to native C99 file I/O), `while` loops with safety guards, and
+reusable `fn` functions. Programs still compile to **standalone, multi-threaded C**
+(zero Python at runtime) or optimized NumPy/OpenBLAS Python, and `aether mcp`
+exposes the whole toolchain to AI agents.
 
 ## 1. Lexical rules
 
@@ -22,12 +22,15 @@ Model Context Protocol.
 ## 2. Grammar (EBNF)
 
 ```
-program     := { use_decl | task_decl }
+program     := { use_decl | fn_decl | task_decl }
 use_decl    := "use" IDENT { "." IDENT } NEWLINE
+fn_decl     := "fn" IDENT "(" [ IDENT { "," IDENT } ] ")" "->" type ":"
+               NEWLINE INDENT { stmt } DEDENT
 task_decl   := "task" IDENT [ "->" modifier ] ":" NEWLINE INDENT { stmt } DEDENT
 stmt        := IDENT "=" expr NEWLINE
              | "let" IDENT "=" expr NEWLINE
              | "repeat" ( NUMBER | IDENT ) "times" ":" NEWLINE INDENT { stmt } DEDENT
+             | "while" expr [ "max_iters" "(" NUMBER ")" ] ":" NEWLINE INDENT { stmt } DEDENT
              | "if" expr ":" NEWLINE INDENT { stmt } DEDENT
                [ "else" ":" NEWLINE INDENT { stmt } DEDENT ]
              | "log" expr NEWLINE
@@ -49,23 +52,24 @@ args        := arg { "," arg }
 arg         := [ IDENT ":" ] value
 value       := NUMBER | STRING | IDENT
 modifier    := IDENT [ "(" [ args ] ")" ]
+type        := "int" | "float" | "bool" | "str"
 ```
 
 `run` is a special form: it takes a **model variable**, then the input tensor or
-dataset. `serve` is a blocking statement: the program becomes an HTTP server until
-interrupted (it may only appear as a top-level task statement). Modifiers chain with
-`->`; at most one of each kind is meaningful.
+dataset. `serve` is a blocking statement (top-level only). Modifiers chain with `->`.
 
 ## 3. Declarations
 
 ```
 use ai.core
+use data.core
 use web.core
 use agent.core
 ```
-`ai.core` is required before any AI intent. `web.core` is required before `serve`;
-`agent.core` is required before `repeat` loops (autonomy). Omitting any of them is
-`AE0200` with a fix patch that inserts the line. `use` lines must come before tasks.
+`ai.core` is required before any AI intent. `data.core` before `load_csv`/`save_json`;
+`web.core` before `serve`; `agent.core` before `repeat`/`while` loops. Omitting any
+of them is `AE0200` with a fix patch that inserts the line. `use` lines must come
+before tasks.
 
 ```
 task <Name>:
@@ -79,12 +83,14 @@ entrypoint**. A task body must contain at least one statement. No parameters in 
 | Intent | Signature | Returns | Required modifier |
 |---|---|---|---|
 | allocate input | `tensor(rows, cols)` | `tensor[rows, cols]` | `-> auto_hardware` |
-| load dataset | `load_data(samples: N, features: D, classes: K?)` | `dataset` | `-> auto_hardware` |
+| synthetic dataset | `load_data(samples: N, features: D, classes: K?)` | `dataset` | `-> auto_hardware` |
+| CSV dataset | `load_csv("path.csv", target: "col")` | `dataset` (runtime dims) | `-> auto_hardware`, needs `data.core` |
 | load model | `load_model("model.ae.bin")` | `model` (served) | `-> auto_hardware` |
 | build network | `neural_net(in: X, out: Y, hidden: N?)` | `model` | none (see `optimize`) |
 | build classifier | `classifier(in: D, classes: K, hidden: N?)` | `model` | none (see `optimize`) |
-| training | `train model on dataset(epochs: E)` | — | `-> self_heal` |
+| training | `train model on dataset(epochs: E)` | — (sets `accuracy`) | `-> self_heal` |
 | inference | `run model(data)` | `stream` | `-> stream_output` |
+| JSON out | `save_json(value, "path.json")` | bytes written | needs `data.core` |
 | serving | `serve model on port(P)` | — (blocks) | `-> route("/...")`, needs `web.core` |
 | persistence | `export model -> "model.ae.bin"` | — | — |
 
@@ -155,14 +161,31 @@ raw little-endian f32 `W1, b1, W2, b2`. Classifiers must be trained first
 (`AE0210`). Relative paths resolve against the source file's directory. The same
 format is produced by the C and Python backends.
 
-### Control flow and scalars (v0.4)
+### Control flow and scalars (v0.4+)
 
 | Statement | Semantics |
 |---|---|
-| `let name = expr` | binds a scalar (`int`, `float`, `str`, or `bool`). Types are stable: rebinding with a different type is `AE0210`. Tensors/datasets/models bind with plain assignment. |
+| `let name = expr` | binds a scalar (`int`, `float`, `str`, or `bool`) or the result of a user `fn`. Types are stable: rebinding with a different type is `AE0210`. Tensors/datasets/models bind with plain assignment. |
 | `repeat N times:` | runs the indented body `N` times; `N` is an integer literal (1..1,000,000) or an int variable. Requires `agent.core`. |
+| `while cond:` / `max_iters(N)` | loops while the comparison holds. A built-in safety guard exits after `N` iterations (default 100,000) and emits a `while_guard` event — agents cannot hang forever. Requires `agent.core`. |
 | `if cond:` / `else:` | runs the first branch whose comparison holds. `cond` must be a comparison (`AE0210` otherwise); `else` is optional. |
 | `log expr` | emits a `log` event with the string or number. |
+| `fn name(a, b) -> type:` | reusable pure function over numeric scalars; body uses `let/log/if/repeat/while/return`. At least one `return` is required, and the returned type must match the annotation. Compiled to a static C function. |
+| `accuracy` (built-in) | after any `train`, `accuracy` holds the best validation accuracy seen so far — readable in `while` conditions. |
+
+### `data.core` (v0.5)
+
+- `load_csv("path.csv", target: "col") -> auto_hardware` — parses a CSV with a
+  header row; every non-target column becomes a numeric feature, the target column
+  holds class ids or string labels (interned automatically). Feature/class counts
+  are discovered at runtime and validated against the model. Relative paths resolve
+  against the source directory. Native C99: manual file parsing, no libc CSV deps.
+- `save_json(value, "path.json")` — writes strict JSON: scalars as
+  `{"name": value}`, streams (from `run`) as `{rows, accuracy, loss, gflops,
+  checksum, digest}`, models as `{kind, dims, params, trained}`. Native C99:
+  direct `fputs`, zero Python.
+- `train` binds **`accuracy`** (float): the best validation accuracy so far —
+  the natural `while accuracy < 0.9 max_iters(5):` convergence loop.
 
 Operators: `+ - * / %` (with unary `-`) and comparisons `== != > < >= <=`.
 Precedence: `%` and `*` `/` bind tighter than `+` `-`, which bind tighter than
@@ -234,6 +257,39 @@ task AutonomousPipeline:
         train model on dataset(epochs: 2) -> self_heal
     export model -> "v04_agent.ae.bin"
 ```
+
+A real-data pipeline — CSV in, `while` convergence loop, JSON report out, all in
+native C99 (v0.5):
+
+```aether
+use ai.core
+use data.core
+use agent.core
+
+task RealDataPipeline:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    while accuracy < 0.9 max_iters(5):
+        train model on dataset(epochs: 2) -> self_heal
+    results = run model(dataset) -> stream_output
+    export model -> "v05_pipeline.ae.bin"
+    save_json(results, "report.json")
+```
+
+### GPU dispatch (`auto_hardware` in v0.5)
+
+At compile time Aether probes display/discrete GPUs (`wmic`, `nvidia-smi -L`) and
+the CUDA toolkit (`nvcc`). Dispatch order for `--target auto`:
+
+1. **CUDA** — only when an NVIDIA GPU *and* `nvcc` are both present; emits a
+   `.cu` kernel plan compiled by nvcc.
+2. **C99** — multi-threaded OpenMP + OpenBLAS on the detected SIMD tier
+   (AVX-512 / AVX2 / NEON), with the GPU tier in the `[device]` telemetry.
+3. **Python** — when no C compiler exists.
+
+`--target=cuda` on a machine without nvcc falls back to C99 with an explicit
+note in both human output and JSON (`note` field); it never silently fakes GPU
+execution.
 
 ## 7. Backends and the CLI
 

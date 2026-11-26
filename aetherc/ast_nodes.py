@@ -72,7 +72,7 @@ class Unary:
 
 @dataclass
 class Stmt:
-    kind: str  # assign | let | emit | return | expr | train | export | serve | repeat | if | log
+    kind: str  # assign | let | emit | return | expr | train | export | serve | repeat | while | if | log
     expr: object | None
     line: int
     column: int
@@ -83,9 +83,20 @@ class Stmt:
     path: str | None = None
     port: int | None = None
     count: object | None = None  # repeat: Literal | Name
+    max_iters: int | None = None  # while safety guard
     body: list["Stmt"] = field(default_factory=list)
     else_body: list["Stmt"] = field(default_factory=list)
     modifiers: list[Modifier] = field(default_factory=list)
+
+
+@dataclass
+class Function:
+    name: str
+    params: list[str]
+    ret_type: str  # int | float | bool | str
+    body: list[Stmt]
+    line: int
+    column: int
 
 
 @dataclass
@@ -105,3 +116,4 @@ class Program:
     path: str
     source: str
     lines: list[str] = field(default_factory=list)
+    functions: list[Function] = field(default_factory=list)

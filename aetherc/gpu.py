@@ -17,9 +17,53 @@ _NVIDIA_SMI_CANDIDATES = (
 )
 
 
+_OPENCL_LIBRARIES = (
+    r"C:\Windows\System32\OpenCL.dll",
+    r"C:\Windows\SysWOW64\OpenCL.dll",
+)
+_OPENCL_ICD_REGISTRY_KEYS = (
+    r"SOFTWARE\Khronos\OpenCL\Vendors",
+    r"SOFTWARE\WOW6432Node\Khronos\OpenCL\Vendors",
+)
+
+
+def _windows_opencl_icd_registered() -> bool:
+    """A DLL alone is not enough: a vendor ICD must be registered, otherwise
+    calling into the stub loader crashes. The Khronos key proves it."""
+    try:
+        import winreg
+
+        for key_path in _OPENCL_ICD_REGISTRY_KEYS:
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path):
+                    return True
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return False
+
+
+@lru_cache(maxsize=1)
+def probe_opencl() -> bool:
+    """Detect a *working* OpenCL runtime (loader DLL + registered vendor ICD)."""
+    if os.name == "nt":
+        dll = any(os.path.isfile(path) for path in _OPENCL_LIBRARIES)
+        return dll and _windows_opencl_icd_registered()
+    for path in (
+        "/usr/lib/x86_64-linux-gnu/libOpenCL.so.1",
+        "/usr/lib/libOpenCL.so.1",
+        "/usr/lib/libOpenCL.so",
+        "/opt/rocm/lib/libOpenCL.so",
+    ):
+        if os.path.isfile(path):
+            return True
+    return shutil.which("clinfo") is not None
+
+
 @lru_cache(maxsize=1)
 def probe_gpu() -> dict:
-    """Detect display/discrete GPUs and a usable CUDA toolchain."""
+    """Detect display/discrete GPUs, CUDA toolchain, and OpenCL runtime."""
     names: list[str] = []
     try:
         output = subprocess.run(
@@ -67,8 +111,12 @@ def probe_gpu() -> dict:
         except Exception:
             cuda_gpu = False
 
+    opencl = probe_opencl()
+
     if vendor == "nvidia" and nvcc and cuda_gpu:
         tier = "cuda"
+    elif opencl and vendor in ("nvidia", "amd", "intel"):
+        tier = "opencl"
     elif vendor in ("nvidia", "amd"):
         tier = "discrete-gpu"
     elif vendor == "intel":
@@ -81,6 +129,7 @@ def probe_gpu() -> dict:
         "name": gpu_name,
         "cuda_gpu": cuda_gpu,
         "nvcc": nvcc,
+        "opencl": opencl,
         "tier": tier,
     }
 
@@ -88,6 +137,10 @@ def probe_gpu() -> dict:
 def cuda_ready() -> bool:
     info = probe_gpu()
     return bool(info["cuda_gpu"] and info["nvcc"])
+
+
+def opencl_ready() -> bool:
+    return bool(probe_gpu().get("opencl"))
 
 
 def dispatch_target(preferred: str = "auto") -> tuple[str, str | None]:
@@ -105,8 +158,14 @@ def dispatch_target(preferred: str = "auto") -> tuple[str, str | None]:
             "c",
             "CUDA GPU present but nvcc was not found; dispatching to the C99 backend",
         )
+    if preferred == "opencl":
+        # Emission + compilation need no OpenCL SDK (the generated binary loads
+        # the ICD at runtime); only execution reports the honest fallback.
+        return "opencl", None
     if preferred == "auto":
         if cuda_ready():
             return "cuda", None
+        if opencl_ready():
+            return "opencl", "auto-dispatched to the OpenCL tier"
         return "c", None
     return preferred, None

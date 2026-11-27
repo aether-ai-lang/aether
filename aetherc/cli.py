@@ -16,6 +16,7 @@ from .codegen import generate
 from .diagnostics import AETHER_VERSION, AetherError, Diagnostic, merged_fix_patch
 from .lexer import tokenize
 from .parser import parse
+from .project import find_packages_dir, init_project, install_package, package_functions
 
 BOLD = "\x1b[1m"
 DIM = "\x1b[2m"
@@ -48,6 +49,34 @@ def configure_threads() -> None:
         "NUMEXPR_NUM_THREADS",
     ):
         os.environ.setdefault(key, threads)
+
+
+def _merge_package_functions(program, source_path: Path) -> None:
+    """Import top-level `fn` libraries from installed packages (use pkg.<name>)."""
+    packages_dir = find_packages_dir(source_path)
+    if packages_dir is None:
+        return
+    wanted = {
+        use.module.split(".", 1)[1]
+        for use in program.uses
+        if use.module.startswith("pkg.")
+    }
+    existing = {fn.name for fn in program.functions}
+    for package in sorted(wanted):
+        package_dir = packages_dir / package
+        if not package_dir.is_dir():
+            continue
+        for ae_file in package_functions(package_dir):
+            try:
+                source = ae_file.read_text(encoding="utf-8-sig")
+                package_program = parse(tokenize(source, str(ae_file)), str(ae_file), source)
+            except AetherError:
+                continue
+            for fn in package_program.functions:
+                if fn.name in existing:
+                    continue
+                program.functions.append(fn)
+                existing.add(fn.name)
 
 
 def analyze(path: Path) -> dict:
@@ -100,6 +129,7 @@ def analyze(path: Path) -> dict:
 
     result["parse_ms"] = (time.perf_counter() - started) * 1000.0
     result["program"] = program
+    _merge_package_functions(program, path)
 
     started = time.perf_counter()
     try:
@@ -415,6 +445,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Inspecting generated CUDA never needs nvcc; emit it before dispatch.
     if target == "cuda" and args.emit_only:
         return _run_cuda(args, path, result, program, task_name, warnings, ui, None)
+    if target == "opencl":
+        return _run_opencl(args, path, result, program, task_name, warnings, ui)
     if target in ("c", "auto", "cuda"):
         from .gpu import dispatch_target
 
@@ -690,6 +722,151 @@ def _run_cuda(
     return 0
 
 
+def _run_opencl(
+    args: argparse.Namespace,
+    path: Path,
+    result: dict,
+    program,
+    task_name: str,
+    warnings: list[Diagnostic],
+    ui: UI,
+) -> int:
+    """Compile the OpenCL plan (runtime-loaded ICD) and run it."""
+    from .cbackend import (
+        CBackendError,
+        compile_opencl,
+        generate_opencl,
+        parse_events,
+        run_binary,
+    )
+    from .gpu import probe_gpu
+
+    json_mode = args.json
+    if not json_mode:
+        print(f"{ui.paint(BOLD, 'aether')} {AETHER_VERSION}  {ui.paint(DIM, '|')}  {path.name}")
+        print()
+        print(f"  {'parse':<7} {result['parse_ms']:6.2f} ms   {result['tokens']} tokens")
+        gpu = probe_gpu()
+        print(
+            f"  {'target':<7} opencl | runtime-loaded ICD | "
+            f"detected: {'yes' if gpu.get('opencl') else 'no ICD found (runtime will report fallback)'}"
+        )
+
+    out_dir = Path(args.build_dir) if args.build_dir else path.parent / ".aether_build"
+    try:
+        host_source, kernel_source = generate_opencl(program, path.name)
+        opencl_binary, opencl_compile_ms = compile_opencl(
+            host_source, kernel_source, out_dir, path.stem, _toolchain_for_opencl()
+        )
+    except CBackendError as exc:
+        payload = {
+            "status": "error",
+            "code": "AE9004",
+            "message": f"OpenCL backend unavailable: {exc}",
+            "hint": "Verify a C compiler is installed, or run with --target=c / --target=python.",
+        }
+        print_json(payload)
+        return 1
+
+    artifact = out_dir / f"{path.stem}_opencl.cl"
+    if args.emit_only:
+        if json_mode:
+            print_json(
+                {
+                    "status": "ok",
+                    "aether": AETHER_VERSION,
+                    "file": str(path),
+                    "target": "opencl",
+                    "artifact": str(artifact),
+                    "host": str(opencl_binary),
+                }
+            )
+        else:
+            print(f"  {'host':<7} {display_path(opencl_binary)}")
+            print(f"  {'kernel':<7} {display_path(artifact)}")
+        return 0
+
+    # No working ICD detected: report the fallback honestly instead of
+    # executing against a possibly-stub OpenCL.dll (which can crash).
+    if not probe_gpu().get("opencl"):
+        fallback_events = [
+            {
+                "event": "device",
+                "device": "opencl-probe",
+                "tier": "opencl-unavailable",
+            },
+            {
+                "event": "fallback",
+                "message": "no OpenCL runtime found (install an ICD from your GPU vendor)",
+                "next": "dispatching semantics to the C99/AVX-512 tier (--target=c)",
+            },
+        ]
+        if json_mode:
+            print_json(
+                {
+                    "status": "ok",
+                    "aether": AETHER_VERSION,
+                    "file": str(path),
+                    "task": task_name,
+                    "target": "opencl",
+                    "events": fallback_events,
+                    "result": None,
+                }
+            )
+        else:
+            for event in fallback_events:
+                if event["event"] == "device":
+                    print("  [device] auto_hardware -> opencl probe | runtime-loaded ICD")
+                else:
+                    print(f"  [fallback] {event['message']}")
+                    print(f"  [fallback] {event['next']}")
+        return 0
+
+    if json_mode:
+        started = time.perf_counter()
+        proc = run_binary(opencl_binary, task_name, events=True, silent=True, base_dir=str(path.parent.resolve()))
+        wall_ms = (time.perf_counter() - started) * 1000.0
+        events = parse_events(proc.stderr)
+        print_json(
+            {
+                "status": "ok" if proc.returncode == 0 else "error",
+                "aether": AETHER_VERSION,
+                "file": str(path),
+                "task": task_name,
+                "target": "opencl",
+                "events": events,
+                "elapsed_ms": wall_ms,
+            }
+        )
+        return 0 if proc.returncode == 0 else 3
+
+    started = time.perf_counter()
+    sys.stdout.flush()
+    proc = run_binary(opencl_binary, task_name, events=False, silent=False, inherit=True, base_dir=str(path.parent.resolve()))
+    wall_ms = (time.perf_counter() - started) * 1000.0
+    print()
+    if proc.returncode != 0:
+        print_json(
+            {
+                "status": "error",
+                "code": "AE9000",
+                "message": f"OpenCL task '{task_name}' failed with exit code {proc.returncode}",
+            }
+        )
+        return 3
+    print(f"  {ui.paint(DIM, f'{wall_ms:.1f} ms wall (opencl)')}")
+    return 0
+
+
+def _toolchain_for_opencl():
+    from .cbackend import CBackendError, find_toolchain
+
+    toolchain = find_toolchain()
+    if toolchain is None:
+        raise CBackendError("no C compiler found for the OpenCL host program")
+    return toolchain
+
+
 def _run_native(
     args: argparse.Namespace,
     path: Path,
@@ -880,10 +1057,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--target",
-        choices=("auto", "c", "cuda", "python"),
+        choices=("auto", "c", "cuda", "opencl", "python"),
         default="auto",
         help=(
-            "execution backend: auto-dispatch to CUDA when a GPU + nvcc exist, "
+            "execution backend: auto-dispatch to CUDA/OpenCL when available, "
             "else native C (default), else Python"
         ),
     )
@@ -926,6 +1103,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mcp_parser.set_defaults(func=_cmd_mcp)
 
+    init_parser = subparsers.add_parser(
+        "init", help="scaffold a new Aether project (manifest + src/main.ae)"
+    )
+    init_parser.add_argument("name", help="project name (also the directory name)")
+    init_parser.set_defaults(func=_cmd_init)
+
+    install_parser = subparsers.add_parser(
+        "install",
+        help="install a reusable .ae module package into .aether_packages/",
+    )
+    install_parser.add_argument(
+        "source", help="git URL, local directory of .ae modules, or a single .ae file"
+    )
+    install_parser.add_argument(
+        "--project", help="project directory (default: current directory)"
+    )
+    install_parser.set_defaults(func=_cmd_install)
+
     version_parser = subparsers.add_parser("version", help="print the compiler version")
     version_parser.set_defaults(func=lambda args: _print_version())
 
@@ -942,6 +1137,39 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     from .mcp import run_mcp
 
     return run_mcp()
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    try:
+        root = init_project(args.name, Path.cwd())
+    except (ValueError, FileExistsError) as exc:
+        print_json({"status": "error", "code": "AE0212", "message": str(exc)})
+        return 2
+    print(f"initialized project {args.name}  |  aether {AETHER_VERSION}")
+    print(f"  {root / 'aether.toml'}")
+    print(f"  {root / 'src' / 'main.ae'}   <- entry program")
+    print(f"  {root / 'README.md'}")
+    print(f"  {root / '.gitignore'}")
+    print(f"  {root / '.aether_packages'}")
+    print()
+    print("next:")
+    print(f"  cd {args.name}")
+    print(f"  aether run src/main.ae")
+    return 0
+
+
+def _cmd_install(args: argparse.Namespace) -> int:
+    root = Path(args.project).resolve() if args.project else Path.cwd()
+    try:
+        name, how = install_package(args.source, root)
+    except (ValueError, FileExistsError, RuntimeError) as exc:
+        print_json({"status": "error", "code": "AE0212", "message": str(exc)})
+        return 2
+    installed = root / ".aether_packages" / name
+    print(f"installed {name}  ({how})")
+    print(f"  -> {installed}")
+    print(f"import it with:  use pkg.{name}")
+    return 0
 
 
 def _print_version() -> int:

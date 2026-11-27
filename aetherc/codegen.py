@@ -155,6 +155,16 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
                     model = value.value
                     break
         return f"rt.ask_llm({_expr_src(bound.get('prompt'), task_policy)}, {model!r})"
+    if call.name == "plan":
+        bound = _bind(call, ["goal"])
+        max_steps = 3
+        for mod in call.modifiers:
+            if mod.name == "max_steps" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, int):
+                    max_steps = value.value
+                    break
+        return f"rt.plan({_expr_src(bound.get('goal'), task_policy)}, {max_steps})"
     if call.name == "load_model":
         bound = _bind(call, ["path"])
         return f"rt.load_model({_value_src(bound.get('path'))})"

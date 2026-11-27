@@ -1,16 +1,17 @@
-# Aether (.ae) — Language Specification v0.7
+# Aether (.ae) — Language Specification v0.8
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
-training run, a stream, an HTTP endpoint, an LLM call); the compiler decides *how*
-(device, dtype, fusion, buffering, threading, even the BLAS thread pool). v0.7 adds
-**native LLM orchestration** (`llm.core`: `ask llm("prompt") -> model("...")` compiles
-to raw C99 HTTP POST logic speaking any OpenAI-compatible endpoint, with a
-deterministic offline mock for CI), **full tensor math** (`min`/`max`/`argmax` and
-element-wise scaling `tensor * 0.5`), and **CUDA training kernels** (`--target=cuda`
-now emits forward/backward SGD kernels, not just inference). Earlier versions brought
-the zero-Python standalone binary (`python build_standalone.py` → `dist/aether.exe`),
-GPU dispatch, persistent agent memory, `data.core` CSV/JSON I/O, `while` loops with
-safety guards, `fn` functions, native HTTP serving, and the `aether mcp` agent server.
+training run, a stream, an HTTP endpoint, an LLM call, a plan); the compiler decides
+*how* (device, dtype, fusion, buffering, threading, even the BLAS thread pool). v0.8
+adds the **Aether package manager** (`aether init` scaffolds projects with an
+`aether.toml` manifest; `aether install` pulls reusable `.ae` modules into
+`.aether_packages/`, imported via `use pkg.<name>`), **declarative agent planning**
+(`plan("goal") -> max_steps(N)` decomposes a goal into steps through the LLM
+pipeline, mock-aware), and the **OpenCL dispatch tier** (`--target=opencl` emits an
+OpenCL host/kernel plan that loads the vendor ICD at runtime — no SDK needed — with
+honest fallback telemetry). Earlier versions brought the zero-Python standalone
+binary, GPU dispatch, persistent memory, `data.core`, `while`/`fn`, native HTTP
+serving, `llm.core`, CUDA training kernels, and the `aether mcp` agent server.
 
 ## 1. Lexical rules
 
@@ -68,11 +69,31 @@ use data.core
 use web.core
 use agent.core
 use llm.core
+use pkg.<name>
 ```
 `ai.core` is required before any AI intent. `data.core` before `load_csv`/`save_json`;
 `web.core` before `serve`; `agent.core` before `repeat`/`while` loops; `llm.core`
 before `ask llm`. Omitting any of them is `AE0200` with a fix patch that inserts the
 line. `use` lines must come before tasks.
+
+### Projects and packages (v0.8)
+
+```powershell
+aether init my_agent            # scaffolds my_agent/ with aether.toml, src/main.ae
+cd my_agent
+aether install https://github.com/user/aether-mathlib.git
+aether install ../shared/tools.ae   # local dirs or single .ae files also work
+```
+
+- `aether init <name>` — creates `aether.toml` (name/version/entry), `src/main.ae`,
+  `README.md`, `.gitignore`, and `.aether_packages/`.
+- `aether install <source>` — installs into `.aether_packages/<name>/` from a git
+  URL (`git clone --depth 1`), a local directory of `.ae` modules, or a single
+  `.ae` file.
+- `use pkg.<name>` — resolves against `.aether_packages/` near the source file;
+  uninstalled packages are a clear `AE0200` diagnostic. Top-level `fn` declarations
+  from the package's `.ae` files are merged into the program at compile time
+  (program-local functions win on name collisions).
 
 ```
 task <Name>:

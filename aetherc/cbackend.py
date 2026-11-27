@@ -16,6 +16,7 @@ from pathlib import Path
 
 from .ast_nodes import Binary, Call, Literal, Name, Program, Stmt, Task, Unary
 from .cuda_template import CUDA_TEMPLATE
+from .opencl_template import OPENCL_HOST_TEMPLATE, OPENCL_KERNEL_SOURCE
 
 AETHER_C_VERSION = "1"
 
@@ -940,13 +941,33 @@ static StreamResult ae_stream_classifier(const Model *m, const Dataset *d, int c
     return result;
 }
 
+static char *ae_json_escape_heap(const char *src) {
+    size_t cap = strlen(src) * 6 + 8;  /* worst case: every char -> \uXXXX */
+    char *out = (char *)ae_alloc(cap);
+    size_t o = 0;
+    for (const char *p = src; *p && o + 7 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20) { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return out;
+}
 static void ae_emit_text(const char *text) {
-    ae_event("{\"event\":\"print\",\"text\":\"%s\",\"backend\":\"c\"}", text);
+    char *escaped = ae_json_escape_heap(text);
+    ae_event("{\"event\":\"print\",\"text\":\"%s\",\"backend\":\"c\"}", escaped);
+    free(escaped);
     ae_human("  [emit]   %s", text);
 }
 
 static void ae_log_text(const char *text) {
-    ae_event("{\"event\":\"log\",\"text\":\"%s\",\"backend\":\"c\"}", text);
+    char *escaped = ae_json_escape_heap(text);
+    ae_event("{\"event\":\"log\",\"text\":\"%s\",\"backend\":\"c\"}", escaped);
+    free(escaped);
     ae_human("  [log]    %s", text);
 }
 
@@ -1361,6 +1382,7 @@ static Tensor ae_tensor_scaled(const Tensor *t, double factor) {
 }
 
 /* ------------------------------------------------------------- string utils */
+
 static char *ae_str_dup(const char *text) {
     size_t len = strlen(text);
     char *copy = (char *)ae_alloc(len + 1);
@@ -1383,22 +1405,6 @@ static char *ae_str_of(double value) {
 }
 
 /* ------------------------------------------------------------------ llm.core */
-static char *ae_json_escape_heap(const char *src) {
-    size_t cap = strlen(src) * 2 + 3;
-    char *out = (char *)ae_alloc(cap);
-    size_t o = 0;
-    for (const char *p = src; *p && o + 7 < cap; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
-        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
-        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
-        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
-        else if (c < 0x20) { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
-        else out[o++] = (char)c;
-    }
-    out[o] = 0;
-    return out;
-}
 
 static char *ae_json_string_field(const char *body, const char *key) {
     char pattern[128];
@@ -1521,6 +1527,49 @@ static char *ae_llm_ask(const char *prompt, const char *model) {
     ae_human("  [llm]    %s | %d chars in | %d chars out | %s | %.1f ms",
              model, (int)strlen(prompt), reply ? (int)strlen(reply) : 0, mode, ms);
     if (!reply) reply = ae_str_dup("");
+    return reply;
+}
+
+/* -------------------------------------------------------------- planning */
+static char *ae_plan(const char *goal, int max_steps) {
+    const char *mock_env = getenv("AETHER_LLM_MOCK");
+    const char *url_env = getenv("AETHER_LLM_URL");
+    const char *key_env = getenv("AETHER_LLM_KEY");
+    int mock = (mock_env && strcmp(mock_env, "1") == 0) || !(url_env && key_env);
+    const char *mode = (mock_env && strcmp(mock_env, "1") == 0) ? "mock" : "auto-mock";
+    char *reply = NULL;
+
+    if (mock) {
+        static const char *templates[] = {
+            "Parse the goal and constraints",
+            "Gather the data and context",
+            "Execute the core analysis",
+            "Validate the results",
+            "Summarize the findings",
+        };
+        const int template_count = 5;
+        if (max_steps < 1) max_steps = 1;
+        if (max_steps > template_count) max_steps = template_count;
+        size_t cap = strlen(goal) + (size_t)max_steps * 96 + 16;
+        reply = (char *)ae_alloc(cap);
+        size_t offset = 0;
+        for (int i = 0; i < max_steps; i++) {
+            offset += (size_t)snprintf(reply + offset, cap - offset, "%d. %s%s",
+                                       i + 1, templates[i], i + 1 < max_steps ? "\n" : "");
+        }
+        mode = (mock_env && strcmp(mock_env, "1") == 0) ? "mock" : "auto-mock";
+    } else {
+        char prompt[4096];
+        snprintf(prompt, sizeof(prompt),
+                 "Break this goal into at most %d numbered steps. Reply with the "
+                 "numbered list only.\nGoal: %s", max_steps, goal);
+        reply = ae_llm_ask(prompt, "gpt-4o-mini");
+        mode = "llm";
+    }
+
+    ae_event("{\"event\":\"plan\",\"goal_chars\":%d,\"max_steps\":%d,\"mode\":\"%s\",\"backend\":\"c\"}",
+             (int)strlen(goal), max_steps, mode);
+    ae_human("  [plan]   %d step(s) | %s", max_steps, mode);
     return reply;
 }
 
@@ -1996,7 +2045,7 @@ def _is_str_expr(node: object, known: dict[str, tuple[str, str]], strings: set[s
     if isinstance(node, Name):
         return node.id in strings
     if isinstance(node, Call):
-        if node.name in ("ask_llm", "str"):
+        if node.name in ("ask_llm", "str", "plan"):
             return True
         return node.name in _FN_RETS and _FN_RETS[node.name] == "str"
     if isinstance(node, Binary) and node.op == "+":
@@ -2199,6 +2248,17 @@ def _expr_c(
                     break
         prompt = _expr_c(bound.get("prompt"), known, chunks, strings)
         return f'ae_llm_ask({prompt}, "{_c_string(model)}")'
+    if node.name == "plan":
+        bound = _bind(node, ["goal"])
+        max_steps = 3
+        for mod in node.modifiers:
+            if mod.name == "max_steps" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, int):
+                    max_steps = value.value
+                    break
+        goal = _expr_c(bound.get("goal"), known, chunks, strings)
+        return f"ae_plan({goal}, {max_steps})"
     if node.name in _FNS:
         args = [_expr_c(arg.value, known, chunks, strings) for arg in node.args]
         return f"ae_fn_{node.name}({', '.join(args)})"
@@ -2763,6 +2823,47 @@ def generate_cuda(program: Program, source_name: str) -> str:
         .replace("__SAMPLES__", str(plan["samples"]))
         .replace("__CLASSES__", str(plan["classes"]))
     )
+
+
+def generate_opencl(program: Program, source_name: str) -> tuple[str, str]:
+    """Emit an OpenCL plan: host C (runtime-loaded ICD) + .cl kernel source."""
+    source = _json_string(source_name.replace("\\", "/"))
+    host = OPENCL_HOST_TEMPLATE.replace("__SOURCE__", source)
+    return host, OPENCL_KERNEL_SOURCE
+
+
+def compile_opencl(host_source: str, kernel_source: str, out_dir: Path, stem: str, toolchain: Toolchain) -> tuple[Path, float]:
+    import hashlib
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    host_file = out_dir / f"{stem}_opencl.c"
+    kernel_file = out_dir / f"{stem}_opencl.cl"
+    host_file.write_text(host_source, encoding="utf-8", newline="\n")
+    kernel_file.write_text(kernel_source, encoding="utf-8", newline="\n")
+    binary = out_dir / (f"{stem}_opencl.exe" if os.name == "nt" else f"{stem}_opencl")
+    stamp = out_dir / f"{stem}_opencl.aebuild"
+
+    digest = hashlib.sha256((host_source + kernel_source).encode("utf-8")).hexdigest()[:24]
+    if binary.is_file() and stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == digest:
+        return binary, 0.0
+
+    # The host loads the ICD at runtime, so no OpenCL SDK or libs are needed.
+    command = [toolchain.compiler, "-O2", "-o", str(binary), str(host_file)]
+    if os.name == "nt":
+        command += ["-lws2_32"]
+    started = time.perf_counter()
+    proc = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    compile_ms = (time.perf_counter() - started) * 1000.0
+    if proc.returncode != 0 or not binary.is_file():
+        raise CBackendError(
+            "OpenCL host compilation failed\n"
+            + " ".join(command)
+            + "\n"
+            + (proc.stdout or "")
+            + (proc.stderr or "")
+        )
+    stamp.write_text(digest, encoding="utf-8", newline="\n")
+    return binary, compile_ms
 
 
 def compile_cuda(source: str, out_dir: Path, stem: str) -> tuple[Path, float, str]:

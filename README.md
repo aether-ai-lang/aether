@@ -14,10 +14,11 @@ itself no longer needs Python installed.
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![standalone](https://img.shields.io/badge/standalone-aether.exe%20%28zero%20Python%29-critical)
 ![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
-![gpu](https://img.shields.io/badge/GPU-auto%20dispatch%20%28CUDA%20training%20kernels%29-blueviolet)
+![gpu](https://img.shields.io/badge/GPU-CUDA%20%3E%20OpenCL%20%3E%20C99%20dispatch-blueviolet)
+![packages](https://img.shields.io/badge/packages-aether%20init%20%2F%20install-teal)
 ![llm](https://img.shields.io/badge/llm.core-native%20C99%20client%20%2B%20mock%20mode-ff69b4)
 ![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
-![tests](https://img.shields.io/badge/tests-38%2F38-brightgreen)
+![tests](https://img.shields.io/badge/tests-40%2F40-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
 **Load real CSV data. Train in a convergence loop. Export model + JSON report.
@@ -50,6 +51,30 @@ task ServeAI:
 </div>
 
 ---
+
+## v0.8 — Packages, Planning & the OpenCL Tier
+
+```powershell
+aether init my_agent                          # manifest + src/main.ae + gitignore
+cd my_agent
+aether install ../shared/tools.ae             # git URLs, dirs, or single files
+```
+
+- **`aether init <name>`** — scaffolds a project: `aether.toml` manifest,
+  `src/main.ae`, `README.md`, `.gitignore`, `.aether_packages/`.
+- **`aether install <source>`** — installs reusable `.ae` modules from a git URL,
+  a local directory, or a single `.ae` file into `.aether_packages/<name>/`.
+  Import with `use pkg.<name>` — the package's top-level `fn` libraries merge into
+  your program at compile time; uninstalled packages produce a clear `AE0200`
+  diagnostic that names the exact fix.
+- **`plan("goal") -> max_steps(3)`** — declarative multi-step agent planning
+  through the LLM pipeline (mock-aware, deterministic offline), returning a
+  numbered plan as a string:
+  `1. Parse the goal and constraints · 2. Gather the data and context · 3. …`
+- **OpenCL dispatch tier** — `--target=opencl` emits a host/kernel plan that
+  loads the vendor ICD at **runtime** (LoadLibrary/dlopen — no OpenCL SDK needed
+  to compile). Probing requires a *registered* ICD (Khronos registry), not just a
+  stub DLL; without one you get honest fallback telemetry instead of a crash.
 
 ## v0.7 — LLM Orchestration from Machine Code
 
@@ -452,6 +477,7 @@ examples/control_flow.ae     loops, branches, arithmetic, fn, while guards
 examples/real_data_pipeline.ae  CSV -> while convergence -> native JSON report
 examples/smart_agent_memory.ae  persistent memory across executions (v0.6)
 examples/llm_agent_workflow.ae  CSV -> train -> LLM summary -> JSON (v0.7)
+examples/agent_planner.ae    multi-step planning + training (v0.8)
 examples/autonomous_loop.ae  self-retraining agent pipeline
 examples/self_heal.ae        intentionally broken file for the healing demo
 examples/data/readings.csv   480-row sample dataset for data.core
@@ -467,19 +493,20 @@ python -m unittest discover -s tests -v
 End-to-end coverage: compile and run on **both** backends, standalone-C emission,
 training + AEB1 export parity, **live HTTP inference against the compiled native
 server and the Python server**, **real CSV ingestion + while convergence + native
-JSON output on both backends**, **persistent memory across separate executions
-(native + Python)**, **mock-mode LLM orchestration on both backends**, **CUDA
-training-kernel emission**, GPU probe/CUDA fallback behavior, MCP
+JSON output**, **persistent memory across separate executions (native + Python)**,
+**mock-mode LLM orchestration on both backends**, **CUDA training-kernel emission**,
+**OpenCL emit/compile/fallback**, **project init + package install + pkg import**,
+agent planning on both backends, GPU probe/CUDA fallback behavior, MCP
 initialize/tools/fix/compile/spec flows, patch application, control-flow semantics
 (loops, branches, arithmetic, fn, guards) on both backends, JSON contracts, bench
 output, and applying the combined self-heal patch with `git apply`.
 
-## Roadmap (v0.8+)
+## Roadmap (v0.9+)
 
-- TLS support in the native LLM client (or bundled wolfSSL) for https:// endpoints
+- TLS support in the native LLM client for https:// endpoints
+- Real OpenCL training kernels (forward/backward), CUDA/OpenCL device selection
 - Streaming LLM completions (chunked SSE) as a `stream` intent
-- AMD ROCm / OpenCL dispatch tiers behind `auto_hardware`
-- Tensor arithmetic + slicing; reductions between tensors
+- A public package index (`aether install <name>` from a curated registry)
 - `agent.core` planning intents: tool calls, multi-step reasoning, memory search
 
 ## License

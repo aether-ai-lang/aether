@@ -1224,6 +1224,68 @@ class Runtime:
             return f"{value:.6g}"
         return str(value)
 
+    # ------------------------------------------------------------- planning
+    _PLAN_STEPS = (
+        "Parse the goal and constraints",
+        "Gather the data and context",
+        "Execute the core analysis",
+        "Validate the results",
+        "Summarize the findings",
+    )
+
+    def plan(self, goal: str, max_steps: int) -> str:
+        import json as _json
+        import urllib.error
+        import urllib.request
+
+        goal = str(goal)
+        max_steps = max(1, min(int(max_steps), 10))
+        url = os.environ.get("AETHER_LLM_URL")
+        api_key = os.environ.get("AETHER_LLM_KEY")
+        mock = os.environ.get("AETHER_LLM_MOCK") == "1" or not (url and api_key)
+        mode = "mock" if (mock and os.environ.get("AETHER_LLM_MOCK") == "1") else (
+            "auto-mock" if mock else "llm"
+        )
+
+        if mock:
+            selected = self._PLAN_STEPS[:max_steps]
+            reply = "\n".join(
+                f"{i + 1}. {step}" for i, step in enumerate(selected)
+            )
+        else:
+            prompt = (
+                f"Break this goal into at most {max_steps} numbered steps. "
+                f"Reply with the numbered list only.\nGoal: {goal}"
+            )
+            payload = _json.dumps(
+                {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}]}
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if api_key:
+                request.add_header("Authorization", f"Bearer {api_key}")
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    body = _json.loads(response.read())
+                reply = str(body["choices"][0]["message"]["content"])
+                mode = "llm"
+            except (urllib.error.URLError, KeyError, IndexError, ValueError) as exc:
+                reply = f"[plan error] {type(exc).__name__}: {exc}"
+                mode = "error"
+
+        self._emit_event(
+            "plan",
+            goal=goal,
+            max_steps=max_steps,
+            steps=reply.count("\n") + 1,
+            mode=mode,
+        )
+        return reply
+
     # ------------------------------------------------------------------- logs
     def log(self, value: object) -> None:
         if isinstance(value, float):

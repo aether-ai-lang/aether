@@ -1,0 +1,14 @@
+use ai.core
+use data.core
+use agent.core
+use llm.core
+
+task AgentPlanner:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    let steps = plan("Analyze CSV anomalies and summarize") -> max_steps(3)
+    log steps
+    while accuracy < 0.9 max_iters(4):
+        train model on dataset(epochs: 2) -> self_heal
+    remember("best_acc", accuracy)
+    log accuracy

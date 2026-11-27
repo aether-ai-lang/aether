@@ -437,25 +437,36 @@ def run_bench(args) -> int:
         )
 
     # ---- Aether, Python backend ---------------------------------------------
-    try:
-        med = _median_row(run_aether_python(path, task, threads, repeat))
+    skip_python = bool(os.environ.get("AETHER_BENCH_SKIP_PYTHON"))
+    if skip_python:
         rows.append(
             Row(
                 name="aether -> Python/NumPy",
                 tokens=aether_tokens,
                 lines=aether_lines,
-                **med,
+                note="skipped (AETHER_BENCH_SKIP_PYTHON)",
             )
         )
-    except Exception as exc:
-        rows.append(
-            Row(
-                name="aether -> Python/NumPy",
-                tokens=aether_tokens,
-                lines=aether_lines,
-                note=f"failed: {exc}",
+    else:
+        try:
+            med = _median_row(run_aether_python(path, task, threads, repeat))
+            rows.append(
+                Row(
+                    name="aether -> Python/NumPy",
+                    tokens=aether_tokens,
+                    lines=aether_lines,
+                    **med,
+                )
             )
-        )
+        except Exception as exc:
+            rows.append(
+                Row(
+                    name="aether -> Python/NumPy",
+                    tokens=aether_tokens,
+                    lines=aether_lines,
+                    note=f"failed: {exc}",
+                )
+            )
 
     # ---- hand-written references --------------------------------------------
     skip_refs = bool(os.environ.get("AETHER_BENCH_SKIP_REFERENCES"))

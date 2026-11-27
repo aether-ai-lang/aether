@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 
 from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Program, Stmt, Task, Unary
+from .project import find_packages_dir, package_functions
 from .diagnostics import (
     Diagnostic,
     delete_line_patch,
@@ -14,6 +15,7 @@ from .diagnostics import (
     replace_line_patch,
     replace_span_patch,
 )
+from pathlib import Path
 
 ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core", "llm.core"}
 KNOWN_INTENTS = (
@@ -34,6 +36,7 @@ KNOWN_INTENTS = (
     "argmax",
     "str",
     "ask_llm",
+    "plan",
 )
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
@@ -62,6 +65,7 @@ SIGNATURES = {
     "argmax": "argmax(tensor)",
     "str": "str(value)",
     "ask_llm": 'ask llm("prompt") -> model("name")',
+    "plan": 'plan("goal") -> max_steps(3)',
 }
 
 
@@ -191,6 +195,26 @@ class Checker:
                 )
                 continue
             seen[use.module] = use.line
+
+            if use.module.startswith("pkg."):
+                # Installed packages: `use pkg.<name>` requires an installed
+                # package directory near the source file.
+                package = use.module.split(".", 1)[1]
+                packages_dir = find_packages_dir(Path(self.path))
+                installed = (
+                    packages_dir / package
+                    if packages_dir
+                    else Path(self.path).parent / ".aether_packages" / package
+                )
+                if not installed.is_dir():
+                    self.error(
+                        "AE0200",
+                        f"Package '{package}' is not installed",
+                        use.line,
+                        use.column,
+                        hint=f"Run: aether install <git-url-or-path>   (expected {installed})",
+                    )
+                continue
 
             if use.module not in ALLOWED_MODULES:
                 suggestion = self._suggest(use.module, tuple(sorted(ALLOWED_MODULES)))
@@ -637,6 +661,8 @@ class Checker:
             return self.check_str_cast(call, scope)
         if call.name == "ask_llm":
             return self.check_ask_llm(call, scope)
+        if call.name == "plan":
+            return self.check_plan(call, scope)
         return self.check_run(call, scope)
 
     # ------------------------------------------------------------ intent: tensor
@@ -1149,6 +1175,61 @@ class Checker:
                 call.column,
                 hint='Add the model, e.g. -> model("gpt-4o-mini").',
                 patch=self._append_modifier(call.line, '-> model("gpt-4o-mini")'),
+            )
+        return Ty("str")
+
+    def check_plan(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_agent_core(call)
+        bound, _ = self.bind(call, [("goal", True)])
+
+        goal = bound.get("goal")
+        if goal is not None:
+            ty = self.check_expr(goal, scope, {})
+            if ty.kind != "str":
+                self.error(
+                    "AE0210",
+                    "plan requires a string goal",
+                    getattr(goal, "line", call.line),
+                    getattr(goal, "column", call.column),
+                    hint='Example: plan("Analyze CSV anomalies") -> max_steps(3)',
+                )
+
+        max_steps_mods = [m for m in call.modifiers if m.name == "max_steps"]
+        for mod in call.modifiers:
+            if mod.name != "max_steps":
+                self.error(
+                    "AE0302",
+                    f"Unknown modifier '-> {mod.name}'",
+                    mod.line,
+                    mod.column,
+                    hint="plan accepts only '-> max_steps(N)'.",
+                )
+                continue
+            if (
+                len(mod.args) != 1
+                or not isinstance(mod.args[0].value, Literal)
+                or not isinstance(mod.args[0].value.value, int)
+            ):
+                self.error(
+                    "AE0212",
+                    "max_steps requires one integer literal",
+                    mod.line,
+                    mod.column,
+                    hint="Example: -> max_steps(3)",
+                )
+            elif not 1 <= mod.args[0].value.value <= 10:
+                self.error(
+                    "AE0212",
+                    "max_steps must be between 1 and 10",
+                    mod.args[0].line,
+                    mod.args[0].column,
+                )
+        if len(max_steps_mods) > 1:
+            self.error(
+                "AE0302",
+                "Duplicate '-> max_steps(...)' modifier",
+                max_steps_mods[1].line,
+                max_steps_mods[1].column,
             )
         return Ty("str")
 
@@ -1674,7 +1755,12 @@ class Checker:
     def check_let(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
         expr = stmt.expr
         is_fn_call = isinstance(expr, Call) and expr.name in self.functions
-        is_scalar_intent = isinstance(expr, Call) and expr.name in ("recall", "save_json", "ask_llm")
+        is_scalar_intent = isinstance(expr, Call) and expr.name in (
+            "recall",
+            "save_json",
+            "ask_llm",
+            "plan",
+        )
         if not isinstance(expr, (Literal, Binary, Unary, Name)) and not (is_fn_call or is_scalar_intent):
             self.error(
                 "AE0210",

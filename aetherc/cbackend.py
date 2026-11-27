@@ -2094,7 +2094,10 @@ static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route
     char *query = strchr(path, '?');
     if (query) *query = 0;
 
-    if (!ae_authorized(buf)) {
+    /* /health stays open for liveness probes; auth protects data routes. */
+    int is_health = strcmp(method, "GET") == 0 &&
+                    (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0);
+    if (!is_health && !ae_authorized(buf)) {
         ae_http_respond(fd, 401, "{\"error\":\"unauthorized: set the Authorization: Bearer header\"}");
         ae_event("{\"event\":\"request\",\"method\":\"%s\",\"path\":\"%s\",\"status\":401,\"backend\":\"c\"}",
                  method, path);

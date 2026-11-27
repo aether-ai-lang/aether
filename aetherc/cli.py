@@ -270,6 +270,15 @@ def make_printer(ui: UI):
             print(
                 f"  [{event['op']:<4}]   {event['value']:.6g} | {event['elements']:,} elements"
             )
+        elif kind == "scale":
+            print(
+                f"  [scale]  x{event['factor']:g} | out[{event['rows']}x{event['cols']}]"
+            )
+        elif kind == "ask":
+            print(
+                f"  [llm]    {event['model']} | {event['prompt_chars']} chars in | "
+                f"{event['reply_chars']} chars out | {event['mode']} | {event['ms']:.1f} ms"
+            )
         elif kind == "save_json":
             print(
                 f"  [json]   {Path(event['path']).name} | {event['bytes']} bytes"
@@ -403,6 +412,9 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     target = getattr(args, "target", "python") or "python"
     note = None
+    # Inspecting generated CUDA never needs nvcc; emit it before dispatch.
+    if target == "cuda" and args.emit_only:
+        return _run_cuda(args, path, result, program, task_name, warnings, ui, None)
     if target in ("c", "auto", "cuda"):
         from .gpu import dispatch_target
 
@@ -851,8 +863,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
         description=(
-            "Aether 0.6 - intent-driven AI-agent-native compiler "
-            "(standalone binary, GPU dispatch, agent memory, tensor reductions)"
+            "Aether 0.7 - intent-driven AI-agent-native compiler "
+            "(llm.core native client, tensor math, CUDA training kernels)"
         ),
     )
     parser.add_argument(

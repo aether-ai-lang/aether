@@ -6,17 +6,18 @@
 
 You declare **what** the AI workload is. Aether decides **how** to run it — and ships
 as a **single standalone binary** that compiles your intent to multi-threaded C99
-machine code: training jobs, streaming inference, native HTTP servers, GPU dispatch,
-real CSV→model→JSON pipelines, and **persistent agent memory**. Your agent drives
-everything over **MCP** — and Aether itself no longer needs Python installed.
+machine code: training jobs, streaming inference, native HTTP servers, **LLM
+orchestration from raw sockets**, GPU dispatch, real CSV→model→JSON pipelines, and
+**persistent agent memory**. Your agent drives everything over **MCP** — and Aether
+itself no longer needs Python installed.
 
 ![license](https://img.shields.io/badge/license-MIT-blue)
 ![standalone](https://img.shields.io/badge/standalone-aether.exe%20%28zero%20Python%29-critical)
 ![backend](https://img.shields.io/badge/backend-C99%20%2B%20OpenMP%20%2B%20Winsock2-orange)
-![gpu](https://img.shields.io/badge/GPU-auto%20dispatch%20%28CUDA%20%3E%20C99%20%3E%20Python%29-blueviolet)
-![turing](https://img.shields.io/badge/language-Turing--complete-blueviolet)
+![gpu](https://img.shields.io/badge/GPU-auto%20dispatch%20%28CUDA%20training%20kernels%29-blueviolet)
+![llm](https://img.shields.io/badge/llm.core-native%20C99%20client%20%2B%20mock%20mode-ff69b4)
 ![mcp](https://img.shields.io/badge/MCP-server%20%28stdio%20JSON--RPC%29-9cf)
-![tests](https://img.shields.io/badge/tests-36%2F36-brightgreen)
+![tests](https://img.shields.io/badge/tests-38%2F38-brightgreen)
 ![tokens](https://img.shields.io/badge/tokens-96%25%20saved-success)
 
 **Load real CSV data. Train in a convergence loop. Export model + JSON report.
@@ -49,6 +50,46 @@ task ServeAI:
 </div>
 
 ---
+
+## v0.7 — LLM Orchestration from Machine Code
+
+```aether
+use ai.core
+use data.core
+use agent.core
+use llm.core
+
+task LLMAgentWorkflow:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    probe = tensor(16, 16) -> auto_hardware
+    while accuracy < 0.9 max_iters(4):
+        train model on dataset(epochs: 2) -> self_heal
+    let prev = recall("best_acc", default: 0.0)
+    remember("best_acc", accuracy)
+    let brief = "Fault classifier converged at accuracy " + str(accuracy) + " (previous best " + str(prev) + ")"
+    let reply = ask llm(brief) -> model("gpt-4o-mini")
+    log reply
+    results = run model(dataset) -> stream_output
+    save_json(results, "llm_report.json")
+```
+
+- **`llm.core` / `ask llm`** — compiles to raw C99 HTTP POST logic
+  (Winsock2/POSIX sockets, hand-rolled JSON escaping/parsing, zero dependencies).
+  Point `AETHER_LLM_URL`/`AETHER_LLM_KEY` at any OpenAI-compatible endpoint (local
+  llama.cpp/Ollama works great); set `AETHER_LLM_MOCK=1` for deterministic offline
+  runs — and with no URL/key configured, Aether auto-falls back to mock mode and
+  *says so* in the telemetry.
+- **Tensor math** — `min(t)`, `max(t)`, `argmax(t)` (flat index, returns `int`),
+  and element-wise scaling `t * 0.5` — all valid inside larger expressions
+  (`min(probe * 0.5)`), compiled to native C loops.
+- **String building** — `+` concatenates strings, `str(value)` converts scalars,
+  so prompts can embed live training metrics.
+- **CUDA training kernels** — `--target=cuda` now emits real forward/backward SGD
+  kernels (fused GEMM+bias+ReLU, softmax-CE, transposed GEMMs with atomic
+  accumulation, SGD-momentum and gradient-clipping passes), parameterized by the
+  program's own `classifier`/`train` intents — with the same honest fallback when
+  nvcc is absent.
 
 ## v0.6 — Zero-Python Standalone + Persistent Agent Memory
 
@@ -410,6 +451,7 @@ examples/serve_ai_api.ae     the 4-line HTTP serving demo
 examples/control_flow.ae     loops, branches, arithmetic, fn, while guards
 examples/real_data_pipeline.ae  CSV -> while convergence -> native JSON report
 examples/smart_agent_memory.ae  persistent memory across executions (v0.6)
+examples/llm_agent_workflow.ae  CSV -> train -> LLM summary -> JSON (v0.7)
 examples/autonomous_loop.ae  self-retraining agent pipeline
 examples/self_heal.ae        intentionally broken file for the healing demo
 examples/data/readings.csv   480-row sample dataset for data.core
@@ -426,17 +468,18 @@ End-to-end coverage: compile and run on **both** backends, standalone-C emission
 training + AEB1 export parity, **live HTTP inference against the compiled native
 server and the Python server**, **real CSV ingestion + while convergence + native
 JSON output on both backends**, **persistent memory across separate executions
-(native + Python)**, GPU probe/CUDA fallback behavior, MCP
+(native + Python)**, **mock-mode LLM orchestration on both backends**, **CUDA
+training-kernel emission**, GPU probe/CUDA fallback behavior, MCP
 initialize/tools/fix/compile/spec flows, patch application, control-flow semantics
 (loops, branches, arithmetic, fn, guards) on both backends, JSON contracts, bench
 output, and applying the combined self-heal patch with `git apply`.
 
-## Roadmap (v0.7+)
+## Roadmap (v0.8+)
 
-- Real CUDA training (kernels for SGD backward passes, not just inference)
+- TLS support in the native LLM client (or bundled wolfSSL) for https:// endpoints
+- Streaming LLM completions (chunked SSE) as a `stream` intent
 - AMD ROCm / OpenCL dispatch tiers behind `auto_hardware`
-- Tensor arithmetic + slicing; `min`/`max`/`argmax` reductions
-- HTTPS/TLS and streaming (chunked) responses in `web.core`
+- Tensor arithmetic + slicing; reductions between tensors
 - `agent.core` planning intents: tool calls, multi-step reasoning, memory search
 
 ## License

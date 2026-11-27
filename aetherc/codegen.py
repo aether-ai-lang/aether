@@ -8,6 +8,7 @@ from .ast_nodes import Arg, Binary, Call, Function, Literal, Modifier, Name, Pro
 from .diagnostics import AETHER_VERSION
 
 _USER_FNS: set[str] = set()
+_TENSOR_VARS: set[str] = set()
 _MEMORY_FILE: str = "agent.memory.json"
 
 
@@ -66,6 +67,11 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
         op = call.op
         left = _expr_src(call.left, task_policy)
         right = _expr_src(call.right, task_policy)
+        if op == "*":
+            if isinstance(call.left, Name) and call.left.id in _TENSOR_VARS:
+                return f"rt.scale_tensor({left}, {_expr_src(call.right, task_policy)})"
+            if isinstance(call.right, Name) and call.right.id in _TENSOR_VARS:
+                return f"rt.scale_tensor({right}, {_expr_src(call.left, task_policy)})"
         if op == "%":
             return f"({left} % {right})"
         if op in ("==", "!=", ">", "<", ">=", "<="):
@@ -133,9 +139,22 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
             f"rt.recall({_value_src(bound.get('key'))}, "
             f"{default}, {_MEMORY_FILE!r})"
         )
-    if call.name in ("mean", "sum"):
+    if call.name in ("mean", "sum", "min", "max", "argmax"):
         bound = _bind(call, ["value"])
-        return f"rt.{call.name}({_value_src(bound.get('value'))})"
+        return f"rt.{call.name}({_expr_src(bound.get('value'), task_policy)})"
+    if call.name == "str":
+        bound = _bind(call, ["value"])
+        return f"rt.str_of({_expr_src(bound.get('value'), task_policy)})"
+    if call.name == "ask_llm":
+        bound = _bind(call, ["prompt"])
+        model = "gpt-4o-mini"
+        for mod in call.modifiers:
+            if mod.name == "model" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, str):
+                    model = value.value
+                    break
+        return f"rt.ask_llm({_expr_src(bound.get('prompt'), task_policy)}, {model!r})"
     if call.name == "load_model":
         bound = _bind(call, ["path"])
         return f"rt.load_model({_value_src(bound.get('path'))})"
@@ -253,6 +272,23 @@ def _stmt_src(
     return out
 
 
+def _track_tensor_vars(body: list[Stmt]) -> None:
+    for stmt in _iter_stmts(body):
+        if stmt.kind == "assign" and isinstance(stmt.expr, Call) and stmt.expr.name in (
+            "tensor",
+            "load_data",
+            "load_csv",
+        ):
+            _TENSOR_VARS.add(stmt.name or "")
+        elif stmt.kind == "let" and isinstance(stmt.expr, Binary) and stmt.expr.op == "*":
+            left = stmt.expr.left
+            right = stmt.expr.right
+            if isinstance(left, Name) and left.id in _TENSOR_VARS:
+                _TENSOR_VARS.add(stmt.name or "")
+            elif isinstance(right, Name) and right.id in _TENSOR_VARS:
+                _TENSOR_VARS.add(stmt.name or "")
+
+
 def _iter_stmts(body: list[Stmt]):
     for stmt in body:
         yield stmt
@@ -295,6 +331,9 @@ def generate(program: Program, source_name: str) -> str:
     global _MEMORY_FILE
     _USER_FNS.clear()
     _USER_FNS.update(fn.name for fn in program.functions)
+    _TENSOR_VARS.clear()
+    for task in program.tasks:
+        _track_tensor_vars(task.body)
     _MEMORY_FILE = Path(source_name).stem + ".memory.json"
 
     task_names = [task.name for task in program.tasks]

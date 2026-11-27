@@ -56,12 +56,17 @@ class AetherCliTests(unittest.TestCase):
         self.assertEqual(payload["diagnostics"], [])
 
     def test_run_streams_and_reports_metrics(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
         result = run_cli("run", "hello_aether.ae", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("\x1b", result.stdout)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "ok")
         self.assertEqual(payload["task"], "HelloAether")
+        # auto target: native C when a compiler exists, Python otherwise
+        expected = "c" if find_toolchain() is not None else "python"
+        self.assertEqual(payload["target"], expected)
         chunks = [event for event in payload["events"] if event["event"] == "chunk"]
         self.assertEqual(len(chunks), 8)
         self.assertGreater(payload["result"]["gflops"], 1.0)
@@ -95,13 +100,6 @@ class AetherCliTests(unittest.TestCase):
         self.assertIn("task_HelloAether(void)", source)
         self.assertIn("ae_stream(&net, &data,", source)
         self.assertIn("task_done", source)
-
-    def test_native_run_is_default_when_compiler_present(self) -> None:
-        payload = json.loads(run_cli("run", "hello_aether.ae", "--json").stdout)
-        has_compiler = native_toolchain() is not None
-        expected = "c" if has_compiler else "python"
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["target"], expected)
 
     def test_self_heal_patch_fixes_every_error(self) -> None:
         if shutil.which("git") is None:
@@ -556,6 +554,92 @@ class AetherCliTests(unittest.TestCase):
             any("expects 2 argument(s)" in d["message"] for d in payload["diagnostics"]),
             payload["diagnostics"],
         )
+
+    # ------------------------------------------------------------------ v0.7
+    def test_llm_mock_python_and_native(self) -> None:
+        from aetherc.cbackend import find_toolchain
+
+        cls = type(self)
+        targets = ["python"]
+        if find_toolchain() is not None:
+            targets.append("c")
+
+        for target in targets:
+            result = run_cli(
+                "run",
+                "examples/llm_agent_workflow.ae",
+                "--target",
+                target,
+                "--json",
+                env={"AETHER_LLM_MOCK": "1"},
+            )
+            self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["target"], target)
+            events = payload["events"]
+            asks = [e for e in events if e["event"] == "ask"]
+            self.assertEqual(len(asks), 1)
+            self.assertEqual(asks[0]["model"], "gpt-4o-mini")
+            self.assertEqual(asks[0]["mode"], "mock")
+            reply = [e.get("text", "") for e in events if e["event"] == "log"][0]
+            self.assertIn("mock", reply)
+            self.assertIn("accuracy", reply)
+
+            reductions = [e for e in events if e["event"] == "reduce"]
+            values = {r["op"]: r["value"] for r in reductions}
+            self.assertEqual(len(reductions), 5)
+            self.assertLessEqual(values["min"], values["max"])
+            scales = [e for e in events if e["event"] == "scale"]
+            self.assertEqual(scales[0]["factor"], 0.5)
+            argmax_values = [r["value"] for r in reductions if r["op"] == "argmax"]
+            self.assertTrue(0 <= argmax_values[0] < 256)
+
+    def test_llm_contracts(self) -> None:
+        no_core = write_temp(
+            'use ai.core\n\ntask Ask:\n    log 1\n'
+        )
+        payload = json.loads(run_cli("check", str(no_core)).stdout)
+
+        missing_model = write_temp(
+            "use ai.core\nuse llm.core\n\ntask Ask:\n"
+            '    let reply = ask llm("hello")\n'
+        )
+        payload = json.loads(run_cli("check", str(missing_model)).stdout)
+        self.assertEqual(payload["status"], "error")
+        self.assertTrue(
+            any(d["code"] == "AE0300" for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+        self.assertIn('model("gpt-4o-mini")', payload["fix_patch"])
+
+        numeric_prompt = write_temp(
+            "use ai.core\nuse llm.core\n\ntask Ask:\n"
+            "    let reply = ask llm(42) -> model(\"gpt-4o-mini\")\n"
+        )
+        payload = json.loads(run_cli("check", str(numeric_prompt)).stdout)
+        self.assertTrue(
+            any("string prompt" in d["message"] for d in payload["diagnostics"]),
+            payload["diagnostics"],
+        )
+
+    def test_cuda_training_kernels_emitted(self) -> None:
+        result = run_cli(
+            "run",
+            "examples/autonomous_loop.ae",
+            "--target",
+            "cuda",
+            "--emit-only",
+            "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout[-1500:])
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["target"], "cuda")
+        source = pathlib.Path(payload["artifact"]).read_text(encoding="utf-8")
+        self.assertIn("__global__", source)
+        self.assertIn("ae_sgd_momentum", source)
+        self.assertIn("ae_gemm_atb", source)
+        self.assertIn("#define IN_DIM 64", source)
+        self.assertIn("#define EPOCHS 2", source)
 
     # ------------------------------------------------------------------ v0.6
     def test_agent_memory_python(self) -> None:

@@ -1,16 +1,16 @@
-# Aether (.ae) — Language Specification v0.6
+# Aether (.ae) — Language Specification v0.7
 
 **Aether is intent-driven:** you declare *what* must happen (a dataset, a model, a
-training run, a stream, an HTTP endpoint); the compiler decides *how* (device, dtype,
-fusion, buffering, threading, even the BLAS thread pool). v0.6 makes Aether **100%
-zero-Python standalone**: `python build_standalone.py` produces `dist/aether.exe` —
-a single binary embedding the compiler, the Python backend, and the language spec.
-v0.6 also adds **persistent agent memory** (`remember`/`recall`, compiled to native
-C99 JSON state files that survive across executions) and **tensor reductions**
-(`mean`/`sum` as OpenMP-parallel C loops). Earlier versions brought GPU dispatch
-(`auto_hardware` probes NVIDIA/AMD/Intel; `--target=cuda` compiles CUDA kernels when
-a GPU + nvcc exist), `data.core` CSV/JSON I/O, `while` loops with safety guards,
-`fn` functions, native HTTP serving, and the `aether mcp` agent server.
+training run, a stream, an HTTP endpoint, an LLM call); the compiler decides *how*
+(device, dtype, fusion, buffering, threading, even the BLAS thread pool). v0.7 adds
+**native LLM orchestration** (`llm.core`: `ask llm("prompt") -> model("...")` compiles
+to raw C99 HTTP POST logic speaking any OpenAI-compatible endpoint, with a
+deterministic offline mock for CI), **full tensor math** (`min`/`max`/`argmax` and
+element-wise scaling `tensor * 0.5`), and **CUDA training kernels** (`--target=cuda`
+now emits forward/backward SGD kernels, not just inference). Earlier versions brought
+the zero-Python standalone binary (`python build_standalone.py` → `dist/aether.exe`),
+GPU dispatch, persistent agent memory, `data.core` CSV/JSON I/O, `while` loops with
+safety guards, `fn` functions, native HTTP serving, and the `aether mcp` agent server.
 
 ## 1. Lexical rules
 
@@ -67,11 +67,12 @@ use ai.core
 use data.core
 use web.core
 use agent.core
+use llm.core
 ```
 `ai.core` is required before any AI intent. `data.core` before `load_csv`/`save_json`;
-`web.core` before `serve`; `agent.core` before `repeat`/`while` loops. Omitting any
-of them is `AE0200` with a fix patch that inserts the line. `use` lines must come
-before tasks.
+`web.core` before `serve`; `agent.core` before `repeat`/`while` loops; `llm.core`
+before `ask llm`. Omitting any of them is `AE0200` with a fix patch that inserts the
+line. `use` lines must come before tasks.
 
 ```
 task <Name>:
@@ -175,6 +176,11 @@ format is produced by the C and Python backends.
 | `remember("key", value)` | persists a numeric value to `<source>.memory.json` (created on demand, format documented below). Requires `agent.core`. Emits a `remember` event with the previous value. |
 | `recall("key", default: 0.0)` | reads a persisted value, returning `default` when absent; emits a `recall` event with `found`. Requires `agent.core`. Memory files are plain JSON and portable across the C99 and Python backends — agents literally remember across separate executions. |
 | `mean(tensor)` / `sum(tensor)` | reductions compiled to OpenMP-parallel C loops (`reduction(+:acc)`); both return `float` and emit a `reduce` event. |
+| `min(tensor)` / `max(tensor)` | value reductions over a tensor or tensor expression (`min(probe * 0.5)`), returning `float`. |
+| `argmax(tensor)` | flat index of the largest element, returned as `int`. |
+| `tensor * scalar` | element-wise scaling; returns a new tensor (valid anywhere a tensor expression is accepted). |
+| `str(value)` | scalar-to-string conversion for prompt building; returns `str`. |
+| `ask llm("prompt") -> model("name")` | **LLM orchestration.** Requires `llm.core` and a `-> model("...")` modifier; returns the completion as `str`. |
 | `fn name(a, b) -> type:` | reusable pure function over numeric scalars; body uses `let/log/if/repeat/while/return`. At least one `return` is required, and the returned type must match the annotation. Compiled to a static C function. |
 | `accuracy` (built-in) | after any `train`, `accuracy` holds the best validation accuracy seen so far — readable in `while` conditions. |
 
@@ -192,11 +198,41 @@ format is produced by the C and Python backends.
 - `train` binds **`accuracy`** (float): the best validation accuracy so far —
   the natural `while accuracy < 0.9 max_iters(5):` convergence loop.
 
+### `llm.core` (v0.7)
+
+`ask llm(prompt) -> model("name")` sends `{"model": name, "messages":
+[{"role": "user", "content": prompt}]}` to an OpenAI-compatible endpoint and returns
+the completion string. Prompt building composes with `+` (string concatenation) and
+`str(value)`:
+
+```aether
+let brief = "Fault classifier converged at accuracy " + str(accuracy)
+let reply = ask llm(brief) -> model("gpt-4o-mini")
+log reply
+```
+
+Environment contract:
+
+| Variable | Meaning |
+|---|---|
+| `AETHER_LLM_URL` | full endpoint URL, e.g. `http://127.0.0.1:11434/v1/chat/completions` |
+| `AETHER_LLM_KEY` | bearer token (sent as `Authorization: Bearer ...`) |
+| `AETHER_LLM_MOCK=1` | deterministic offline mock — no network; replies are `[<model> mock] <prompt>` |
+
+When both URL and key are absent the runtime auto-falls back to mock mode and says
+so in the `ask` event (`mode: "auto-mock"`), so CI and unit tests never touch the
+network. The native C99 client speaks **plain HTTP over raw sockets**
+(Winsock2/POSIX — ideal for local llama.cpp/Ollama servers); `https://` endpoints
+require a TLS library outside v0.7's zero-dependency budget, and the C backend
+reports that honestly rather than pretending. The Python backend speaks both
+schemes via the standard library.
+
 Operators: `+ - * / %` (with unary `-`) and comparisons `== != > < >= <=`.
 Precedence: `%` and `*` `/` bind tighter than `+` `-`, which bind tighter than
 comparisons; parentheses group. `/` is **true division** on both backends (C is
-emitted with explicit double casts); `%` is integer-only. Arithmetic requires
-numeric scalars — tensors, datasets, and models are not numbers (`AE0210`).
+emitted with explicit double casts); `%` is integer-only. `+` also concatenates
+strings, and `*` scales tensors (see the table above). Scalar arithmetic requires
+numeric scalars — datasets and models are not numbers (`AE0210`).
 
 ### `emit` and `return`
 `emit <value>` prints a summary of a tensor, dataset, stream result, number, or

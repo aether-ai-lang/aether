@@ -15,7 +15,7 @@ from .diagnostics import (
     replace_span_patch,
 )
 
-ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core"}
+ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core", "llm.core"}
 KNOWN_INTENTS = (
     "tensor",
     "load_data",
@@ -29,6 +29,11 @@ KNOWN_INTENTS = (
     "recall",
     "mean",
     "sum",
+    "min",
+    "max",
+    "argmax",
+    "str",
+    "ask_llm",
 )
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
@@ -52,6 +57,11 @@ SIGNATURES = {
     "recall": 'recall("key", default: 0.0)',
     "mean": "mean(tensor)",
     "sum": "sum(tensor)",
+    "min": "min(tensor)",
+    "max": "max(tensor)",
+    "argmax": "argmax(tensor)",
+    "str": "str(value)",
+    "ask_llm": 'ask llm("prompt") -> model("name")',
 }
 
 
@@ -88,10 +98,12 @@ class Checker:
         self.web_avail = "web.core" in self.uses
         self.agent_avail = "agent.core" in self.uses
         self.data_avail = "data.core" in self.uses
+        self.llm_avail = "llm.core" in self.uses
         self.reported_missing_core = False
         self.reported_missing_web = False
         self.reported_missing_agent = False
         self.reported_missing_data = False
+        self.reported_missing_llm = False
         self.functions: dict[str, Function] = {f.name: f for f in program.functions}
 
     # ------------------------------------------------------------------ utils
@@ -430,6 +442,16 @@ class Checker:
                 return ERROR
             return Ty("bool")
 
+        if expr.op == "+":
+            if left.kind == "str" and right.kind == "str":
+                return Ty("str")
+
+        if expr.op == "*":
+            if left.kind == "tensor" and right.kind in ("int", "float"):
+                return Ty("tensor", shape=left.shape)
+            if right.kind == "tensor" and left.kind in ("int", "float"):
+                return Ty("tensor", shape=right.shape)
+
         if left.kind not in ("int", "float") or right.kind not in ("int", "float"):
             self.error(
                 "AE0210",
@@ -547,6 +569,26 @@ class Checker:
             patch=insert_line_patch(self.path, self.lines, insert_at, "use data.core"),
         )
 
+    def require_llm_core(self, call: Call) -> None:
+        if self.llm_avail or self.reported_missing_llm:
+            return
+        self.reported_missing_llm = True
+
+        if self.program.uses:
+            insert_at = max(u.line for u in self.program.uses) + 1
+        elif self.program.tasks:
+            insert_at = self.program.tasks[0].line
+        else:
+            insert_at = 1
+        self.error(
+            "AE0200",
+            "Missing 'use llm.core' for LLM intents",
+            call.line,
+            call.column,
+            hint="Add 'use llm.core' above the first task to use 'ask llm(...)'.",
+            patch=insert_line_patch(self.path, self.lines, insert_at, "use llm.core"),
+        )
+
     def check_call(self, call: Call, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
         if call.name in self.functions:
             return self.check_fn_call(call, scope)
@@ -589,8 +631,12 @@ class Checker:
             return self.check_remember(call, scope)
         if call.name == "recall":
             return self.check_recall(call, scope)
-        if call.name in ("mean", "sum"):
+        if call.name in ("mean", "sum", "min", "max", "argmax"):
             return self.check_reduction(call, scope)
+        if call.name == "str":
+            return self.check_str_cast(call, scope)
+        if call.name == "ask_llm":
+            return self.check_ask_llm(call, scope)
         return self.check_run(call, scope)
 
     # ------------------------------------------------------------ intent: tensor
@@ -995,12 +1041,19 @@ class Checker:
     def check_reduction(self, call: Call, scope: dict[str, Ty]) -> Ty:
         bound, _ = self.bind(call, [("value", True)])
         node = bound.get("value")
-        if isinstance(node, Name):
-            ty = self.lookup(node, scope)
+        if node is not None:
+            ty = self.check_expr(node, scope, {})
+            if ty.kind == "error":
+                return ERROR
             if ty.kind != "tensor":
+                label = (
+                    f"'{node.id}' is {self.article(ty.kind)}"
+                    if isinstance(node, Name)
+                    else f"the expression is {self.article(ty.kind)}"
+                )
                 self.error(
                     "AE0210",
-                    f"{call.name}() reduces a tensor, but '{node.id}' is {self.article(ty.kind)}",
+                    f"{call.name}() reduces a tensor, but {label}",
                     node.line,
                     node.column,
                     hint="Allocate one with tensor(rows, cols) -> auto_hardware.",
@@ -1010,12 +1063,94 @@ class Checker:
             self.error(
                 "AE0212",
                 f"{call.name}() takes a tensor variable",
-                getattr(node, "line", call.line),
-                getattr(node, "column", call.column),
+                call.line,
+                call.column,
                 hint="Example: log mean(results)",
             )
             return ERROR
+        if call.name == "argmax":
+            return Ty("int")
         return Ty("float")
+
+    def check_str_cast(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        bound, _ = self.bind(call, [("value", True)])
+        node = bound.get("value")
+        if node is not None:
+            ty = self.check_expr(node, scope, {})
+            if ty.kind == "tensor":
+                self.error(
+                    "AE0210",
+                    "str() cannot serialize a whole tensor",
+                    node.line,
+                    node.column,
+                    hint="Reduce it first: str(mean(results)).",
+                )
+                return ERROR
+        return Ty("str")
+
+    def check_ask_llm(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_llm_core(call)
+        bound, _ = self.bind(call, [("prompt", True)])
+
+        prompt = bound.get("prompt")
+        if prompt is not None:
+            ty = self.check_expr(prompt, scope, {})
+            if ty.kind != "str":
+                self.error(
+                    "AE0210",
+                    "ask llm requires a string prompt",
+                    getattr(prompt, "line", call.line),
+                    getattr(prompt, "column", call.column),
+                    hint='Example: ask llm("status report") -> model("gpt-4o-mini")',
+                )
+
+        models = [m for m in call.modifiers if m.name == "model"]
+        for mod in call.modifiers:
+            if mod.name != "model":
+                suggestion = self._suggest(mod.name, ("model",))
+                patch = None
+                if suggestion:
+                    patch = replace_span_patch(
+                        self.path, self.lines, mod.line, mod.column, len(mod.name), suggestion
+                    )
+                self.error(
+                    "AE0302",
+                    f"Unknown modifier '-> {mod.name}'",
+                    mod.line,
+                    mod.column,
+                    hint='ask llm accepts only \'-> model("name")\'.',
+                    patch=patch,
+                )
+                continue
+            if len(mod.args) != 1 or not isinstance(
+                mod.args[0].value, Literal
+            ) or not isinstance(mod.args[0].value.value, str):
+                self.error(
+                    "AE0212",
+                    "model requires one quoted name",
+                    mod.line,
+                    mod.column,
+                    hint='Example: -> model("gpt-4o-mini")',
+                )
+            elif len(mod.args) > 1:
+                self.error(
+                    "AE0302",
+                    "Duplicate '-> model(...)' modifier",
+                    mod.line,
+                    mod.column,
+                    hint="Keep a single model.",
+                )
+
+        if not models:
+            self.error(
+                "AE0300",
+                'ask llm requires \'-> model("name")\'',
+                call.line,
+                call.column,
+                hint='Add the model, e.g. -> model("gpt-4o-mini").',
+                patch=self._append_modifier(call.line, '-> model("gpt-4o-mini")'),
+            )
+        return Ty("str")
 
     # ------------------------------------------------------------- fn functions
     def check_fn_call(self, call: Call, scope: dict[str, Ty]) -> Ty:
@@ -1539,7 +1674,7 @@ class Checker:
     def check_let(self, stmt: Stmt, scope: dict[str, Ty]) -> None:
         expr = stmt.expr
         is_fn_call = isinstance(expr, Call) and expr.name in self.functions
-        is_scalar_intent = isinstance(expr, Call) and expr.name in ("recall", "save_json")
+        is_scalar_intent = isinstance(expr, Call) and expr.name in ("recall", "save_json", "ask_llm")
         if not isinstance(expr, (Literal, Binary, Unary, Name)) and not (is_fn_call or is_scalar_intent):
             self.error(
                 "AE0210",

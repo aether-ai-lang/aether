@@ -10,6 +10,7 @@ dist/
 *.exe
 *.bin
 examples/report.json
+examples/llm_report.json
 *.memory.json
 
 # OS / editor noise

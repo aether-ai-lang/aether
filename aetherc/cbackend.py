@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .ast_nodes import Binary, Call, Literal, Name, Program, Stmt, Task, Unary
+from .cuda_template import CUDA_TEMPLATE
 
 AETHER_C_VERSION = "1"
 
@@ -179,9 +180,48 @@ typedef SOCKET ae_socket_t;
 typedef int ae_socket_t;
 #define AE_INVALID_SOCKET (-1)
 #define AE_CLOSE_SOCKET(s) close(s)
+#include <netdb.h>
 #endif
 
-#define AE_VERSION "0.6"
+static int ae_net_ready = 0;
+
+static void ae_net_once(void) {
+    if (ae_net_ready) return;
+#ifdef _WIN32
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) ae_net_ready = 1;
+#else
+    ae_net_ready = 1;
+#endif
+}
+
+static int ae_recv(ae_socket_t fd, char *buf, int cap) {
+#ifdef _WIN32
+    return recv(fd, buf, cap, 0);
+#else
+    return (int)read(fd, buf, (size_t)cap);
+#endif
+}
+
+static void ae_send_all(ae_socket_t fd, const char *buf, size_t len) {
+#ifdef _WIN32
+    int offset = 0;
+    while (offset < (int)len) {
+        int n = send(fd, buf + offset, (int)(len - (size_t)offset), 0);
+        if (n <= 0) return;
+        offset += n;
+    }
+#else
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t n = write(fd, buf + offset, len - offset);
+        if (n <= 0) return;
+        offset += (size_t)n;
+    }
+#endif
+}
+
+#define AE_VERSION "0.7"
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -1262,6 +1302,228 @@ static double ae_tensor_mean(const Tensor *t) {
     return value;
 }
 
+/* --------------------------------------------------------- reductions + math */
+static double ae_tensor_min(const Tensor *t) {
+    const size_t count = (size_t)t->rows * t->cols;
+    double value = count ? (double)t->data[0] : 0.0;
+    for (size_t i = 1; i < count; i++) {
+        if ((double)t->data[i] < value) value = (double)t->data[i];
+    }
+    ae_event("{\"event\":\"reduce\",\"op\":\"min\",\"value\":%.17g,\"elements\":%lld,\"backend\":\"c\"}",
+             value, (long long)count);
+    ae_human("  [min ]   %.6g | %lld elements", value, (long long)count);
+    return value;
+}
+
+static double ae_tensor_max(const Tensor *t) {
+    const size_t count = (size_t)t->rows * t->cols;
+    double value = count ? (double)t->data[0] : 0.0;
+    for (size_t i = 1; i < count; i++) {
+        if ((double)t->data[i] > value) value = (double)t->data[i];
+    }
+    ae_event("{\"event\":\"reduce\",\"op\":\"max\",\"value\":%.17g,\"elements\":%lld,\"backend\":\"c\"}",
+             value, (long long)count);
+    ae_human("  [max ]   %.6g | %lld elements", value, (long long)count);
+    return value;
+}
+
+static long long ae_tensor_argmax(const Tensor *t) {
+    const size_t count = (size_t)t->rows * t->cols;
+    long long best = 0;
+    for (size_t i = 1; i < count; i++) {
+        if ((double)t->data[i] > (double)t->data[best]) best = (long long)i;
+    }
+    ae_event("{\"event\":\"reduce\",\"op\":\"argmax\",\"value\":%lld,\"elements\":%lld,\"backend\":\"c\"}",
+             best, (long long)count);
+    ae_human("  [argmax] %lld | %lld elements", best, (long long)count);
+    return best;
+}
+
+/* value-taking wrappers: reductions over tensor expressions */
+static double ae_tensor_mean_expr(Tensor t) { return ae_tensor_mean(&t); }
+static double ae_tensor_sum_expr(Tensor t) { return ae_tensor_sum(&t); }
+static double ae_tensor_min_expr(Tensor t) { return ae_tensor_min(&t); }
+static double ae_tensor_max_expr(Tensor t) { return ae_tensor_max(&t); }
+static long long ae_tensor_argmax_expr(Tensor t) { return ae_tensor_argmax(&t); }
+
+static Tensor ae_tensor_scaled(const Tensor *t, double factor) {
+    Tensor out;
+    out.rows = t->rows;
+    out.cols = t->cols;
+    size_t count = (size_t)t->rows * t->cols;
+    out.data = ae_falloc(count);
+    #pragma omp parallel for schedule(static)
+    for (long long i = 0; i < (long long)count; i++) out.data[i] = t->data[i] * (float)factor;
+    ae_event("{\"event\":\"scale\",\"factor\":%.17g,\"rows\":%d,\"cols\":%d,\"backend\":\"c\"}",
+             factor, out.rows, out.cols);
+    ae_human("  [scale]  x%.4g | out[%dx%d]", factor, out.rows, out.cols);
+    return out;
+}
+
+/* ------------------------------------------------------------- string utils */
+static char *ae_str_dup(const char *text) {
+    size_t len = strlen(text);
+    char *copy = (char *)ae_alloc(len + 1);
+    memcpy(copy, text, len + 1);
+    return copy;
+}
+
+static char *ae_str_concat(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *out = (char *)ae_alloc(la + lb + 1);
+    memcpy(out, a, la);
+    memcpy(out + la, b, lb + 1);
+    return out;
+}
+
+static char *ae_str_of(double value) {
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "%.6g", value);
+    return ae_str_dup(buffer);
+}
+
+/* ------------------------------------------------------------------ llm.core */
+static char *ae_json_escape_heap(const char *src) {
+    size_t cap = strlen(src) * 2 + 3;
+    char *out = (char *)ae_alloc(cap);
+    size_t o = 0;
+    for (const char *p = src; *p && o + 7 < cap; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+        else if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c < 0x20) { o += (size_t)snprintf(out + o, cap - o, "\\u%04x", c); }
+        else out[o++] = (char)c;
+    }
+    out[o] = 0;
+    return out;
+}
+
+static char *ae_json_string_field(const char *body, const char *key) {
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *cursor = body;
+    while ((cursor = strstr(cursor, pattern)) != NULL) {
+        cursor += strlen(pattern);
+        while (*cursor == ' ' || *cursor == ':') cursor++;
+        if (*cursor != '"') continue;
+        cursor++;
+        size_t cap = strlen(cursor) + 1;
+        char *out = (char *)ae_alloc(cap);
+        size_t o = 0;
+        while (*cursor && o + 2 < cap) {
+            if (*cursor == '\\' && cursor[1]) {
+                char next = cursor[1];
+                out[o++] = next == 'n' ? '\n' : next == 't' ? '\t' : next == 'r' ? '\r' : next;
+                cursor += 2;
+                continue;
+            }
+            if (*cursor == '"') break;
+            out[o++] = *cursor++;
+        }
+        out[o] = 0;
+        return out;
+    }
+    return NULL;
+}
+
+static char *ae_llm_ask(const char *prompt, const char *model) {
+    const char *mock_env = getenv("AETHER_LLM_MOCK");
+    const char *url_env = getenv("AETHER_LLM_URL");
+    const char *key_env = getenv("AETHER_LLM_KEY");
+    int mock = (mock_env && strcmp(mock_env, "1") == 0) || !(url_env && key_env);
+    double started = ae_now_ms();
+    char *reply = NULL;
+    const char *mode = "mock";
+
+    if (mock) {
+        size_t cap = strlen(model) + strlen(prompt) + 32;
+        reply = (char *)ae_alloc(cap);
+        snprintf(reply, cap, "[%s mock] %s", model, prompt);
+        mode = (mock_env && strcmp(mock_env, "1") == 0) ? "mock" : "auto-mock";
+    } else if (strncmp(url_env, "http://", 7) != 0) {
+        reply = ae_str_dup("[llm error] native backend speaks http:// URLs only; "
+                           "set AETHER_LLM_MOCK=1 or use a local HTTP server");
+        mode = "error";
+    } else {
+        const char *rest = url_env + 7;
+        const char *slash = strchr(rest, '/');
+        char host[256] = {0};
+        int port = 80;
+        const char *path = "/";
+        if (slash) {
+            size_t span = (size_t)(slash - rest);
+            if (span >= sizeof(host)) span = sizeof(host) - 1;
+            memcpy(host, rest, span);
+            path = slash;
+        } else {
+            snprintf(host, sizeof(host), "%s", rest);
+        }
+        char *colon = strchr(host, ':');
+        if (colon) { *colon = 0; port = atoi(colon + 1); }
+
+        char *escaped_prompt = ae_json_escape_heap(prompt);
+        char body[8192];
+        snprintf(body, sizeof(body),
+                 "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+                 model, escaped_prompt);
+        free(escaped_prompt);
+        char request[12288];
+        snprintf(request, sizeof(request),
+                 "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+                 "Content-Length: %d\r\nConnection: close\r\n\r\n%s",
+                 path, host, (int)strlen(body), body);
+
+        ae_net_once();
+        struct addrinfo hints, *res = NULL;
+        char port_str[8];
+        snprintf(port_str, sizeof(port_str), "%d", port);
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(host, port_str, &hints, &res) != 0 || !res) {
+            reply = ae_str_dup("[llm error] cannot resolve host");
+            mode = "error";
+        } else {
+            ae_socket_t fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (fd == AE_INVALID_SOCKET || connect(fd, res->ai_addr, (int)res->ai_addrlen) != 0) {
+                reply = ae_str_dup("[llm error] cannot connect (is the server running?)");
+                mode = "error";
+                if (fd != AE_INVALID_SOCKET) AE_CLOSE_SOCKET(fd);
+            } else {
+                ae_send_all(fd, request, strlen(request));
+                size_t cap = 262144, got = 0;
+                char *buffer = (char *)ae_alloc(cap);
+                for (;;) {
+                    if (got + 1 >= cap) break;
+                    int n = ae_recv(fd, buffer + got, (int)(cap - 1 - got));
+                    if (n <= 0) break;
+                    got += (size_t)n;
+                    buffer[got] = 0;
+                }
+                AE_CLOSE_SOCKET(fd);
+                char *payload = strstr(buffer, "\r\n\r\n");
+                reply = payload ? ae_json_string_field(payload + 4, "content") : NULL;
+                if (!reply) {
+                    reply = ae_str_dup("[llm error] no completion in response");
+                    mode = "error";
+                }
+                free(buffer);
+            }
+            freeaddrinfo(res);
+        }
+    }
+
+    double ms = ae_now_ms() - started;
+    ae_event("{\"event\":\"ask\",\"model\":\"%s\",\"prompt_chars\":%d,\"reply_chars\":%d,\"mode\":\"%s\",\"ms\":%.6f,\"backend\":\"c\"}",
+             model, (int)strlen(prompt), reply ? (int)strlen(reply) : 0, mode, ms);
+    ae_human("  [llm]    %s | %d chars in | %d chars out | %s | %.1f ms",
+             model, (int)strlen(prompt), reply ? (int)strlen(reply) : 0, mode, ms);
+    if (!reply) reply = ae_str_dup("");
+    return reply;
+}
+
 /* ------------------------------------------------------------- AEB1 loading */
 static Model ae_model_load(const char *path) {
     char resolved[1200];
@@ -1326,32 +1588,6 @@ static void ae_on_sigint(int sig) {
     ae_shutdown = 1;
 }
 #endif
-
-static int ae_recv(ae_socket_t fd, char *buf, int cap) {
-#ifdef _WIN32
-    return recv(fd, buf, cap, 0);
-#else
-    return (int)read(fd, buf, (size_t)cap);
-#endif
-}
-
-static void ae_send_all(ae_socket_t fd, const char *buf, size_t len) {
-#ifdef _WIN32
-    int offset = 0;
-    while (offset < (int)len) {
-        int n = send(fd, buf + offset, (int)(len - (size_t)offset), 0);
-        if (n <= 0) return;
-        offset += n;
-    }
-#else
-    size_t offset = 0;
-    while (offset < len) {
-        ssize_t n = write(fd, buf + offset, len - offset);
-        if (n <= 0) return;
-        offset += (size_t)n;
-    }
-#endif
-}
 
 static void ae_http_respond(ae_socket_t fd, int status, const char *json) {
     const char *reason = status == 200 ? "OK"
@@ -1754,10 +1990,47 @@ def _run_expr(call: Call, known: dict[str, tuple[str, str]], chunks: int) -> str
     return f"ae_stream(&{target}, &{data_name}, {chunks})"
 
 
-def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str:
+def _is_str_expr(node: object, known: dict[str, tuple[str, str]], strings: set[str]) -> bool:
+    if isinstance(node, Literal):
+        return isinstance(node.value, str)
+    if isinstance(node, Name):
+        return node.id in strings
+    if isinstance(node, Call):
+        if node.name in ("ask_llm", "str"):
+            return True
+        return node.name in _FN_RETS and _FN_RETS[node.name] == "str"
+    if isinstance(node, Binary) and node.op == "+":
+        return _is_str_expr(node.left, known, strings) or _is_str_expr(node.right, known, strings)
+    return False
+
+
+def _is_tensor_expr(node: object, known: dict[str, tuple[str, str]]) -> bool:
+    if isinstance(node, Name):
+        return known.get(node.id, ("", ""))[0] == "tensor"
+    if isinstance(node, Binary) and node.op == "*":
+        return _is_tensor_expr(node.left, known) or _is_tensor_expr(node.right, known)
+    return False
+
+
+def _expr_c(
+    node: object,
+    known: dict[str, tuple[str, str]],
+    chunks: int,
+    strings: set[str] | None = None,
+) -> str:
+    strings = strings if strings is not None else set()
     if isinstance(node, Binary):
-        left = _expr_c(node.left, known, chunks)
-        right = _expr_c(node.right, known, chunks)
+        left = _expr_c(node.left, known, chunks, strings)
+        right = _expr_c(node.right, known, chunks, strings)
+        if node.op == "+":
+            if _is_str_expr(node, known, strings):
+                return f"ae_str_concat({left}, {right})"
+            return f"(({left}) + ({right}))"
+        if node.op == "*":
+            if _is_tensor_expr(node.left, known):
+                return f"ae_tensor_scaled(&({left}), (double)({right}))"
+            if _is_tensor_expr(node.right, known):
+                return f"ae_tensor_scaled(&({right}), (double)({left}))"
         if node.op == "%":
             return f"((long long)({left}) % (long long)({right}))"
         if node.op == "/":
@@ -1765,7 +2038,7 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
             return f"((double)({left}) / (double)({right}))"
         return f"(({left}) {node.op} ({right}))"
     if isinstance(node, Unary):
-        return f"(-{_expr_c(node.operand, known, chunks)})"
+        return f"(-{_expr_c(node.operand, known, chunks, strings)})"
     if isinstance(node, Literal):
         if isinstance(node.value, str):
             return f'"{_c_string(node.value)}"'
@@ -1900,14 +2173,34 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
         return (
             f'ae_memory_recall("{_c_string(key)}", (double)({default}), "{_MEMORY_FILE_C}")'
         )
-    if node.name in ("mean", "sum"):
+    if node.name in ("mean", "sum", "min", "max"):
         bound = _bind(node, ["value"])
         target = bound.get("value")
-        name = target.id if isinstance(target, Name) else "NULL"
-        reducer = "ae_tensor_mean" if node.name == "mean" else "ae_tensor_sum"
-        return f"{reducer}(&{name})"
+        if isinstance(target, Name):
+            return f"ae_tensor_{node.name}(&{target.id})"
+        return f"ae_tensor_{node.name}_expr({_expr_c(target, known, chunks, strings)})"
+    if node.name == "argmax":
+        bound = _bind(node, ["value"])
+        target = bound.get("value")
+        if isinstance(target, Name):
+            return f"ae_tensor_argmax(&{target.id})"
+        return f"ae_tensor_argmax_expr({_expr_c(target, known, chunks, strings)})"
+    if node.name == "str":
+        bound = _bind(node, ["value"])
+        return f"ae_str_of((double)({_expr_c(bound.get('value'), known, chunks, strings)}))"
+    if node.name == "ask_llm":
+        bound = _bind(node, ["prompt"])
+        model = "gpt-4o-mini"
+        for mod in node.modifiers:
+            if mod.name == "model" and mod.args:
+                value = mod.args[0].value
+                if isinstance(value, Literal) and isinstance(value.value, str):
+                    model = value.value
+                    break
+        prompt = _expr_c(bound.get("prompt"), known, chunks, strings)
+        return f'ae_llm_ask({prompt}, "{_c_string(model)}")'
     if node.name in _FNS:
-        args = [_expr_c(arg.value, known, chunks) for arg in node.args]
+        args = [_expr_c(arg.value, known, chunks, strings) for arg in node.args]
         return f"ae_fn_{node.name}({', '.join(args)})"
     if node.name == "run":
         return _run_expr(node, known, chunks)
@@ -1916,6 +2209,7 @@ def _expr_c(node: object, known: dict[str, tuple[str, str]], chunks: int) -> str
 
 _WIDTHS: dict[str, int] = {}
 _FNS: set[str] = set()
+_FN_RETS: dict[str, str] = {}
 _GUARD_ID: list[int] = [0]
 _MEMORY_FILE_C: str = "agent.memory.json"
 
@@ -1926,14 +2220,28 @@ def _known_width(node: object, known: dict[str, tuple[str, str]]) -> int:
     return 0
 
 
-def _collect_scalars(body: list[Stmt], decls: dict[str, str], strings: set[str]) -> None:
+def _collect_scalars(
+    body: list[Stmt],
+    decls: dict[str, str],
+    strings: set[str],
+    known: dict[str, tuple[str, str]] | None = None,
+) -> None:
     """Pre-declare every `let` scalar at function scope (C needs declarations)."""
+    known = known or {}
     for stmt in _iter_statements(body):
         if stmt.kind == "train" and "accuracy" not in decls:
             decls["accuracy"] = "double"
         if stmt.kind != "let" or not stmt.name:
             continue
         if stmt.name in decls:
+            continue
+        if _is_str_expr(stmt.expr, known, strings):
+            decls[stmt.name] = "const char *"
+            strings.add(stmt.name)
+            continue
+        if _is_tensor_expr(stmt.expr, known):
+            decls[stmt.name] = "Tensor"
+            known[stmt.name] = ("tensor", "")
             continue
         ctype = _scalar_c_type(stmt.expr, strings)
         decls[stmt.name] = ctype
@@ -1965,7 +2273,7 @@ def _task_c(task: Task, chunks: int) -> list[str]:
 
     decls: dict[str, str] = {}
     strings: set[str] = set()
-    _collect_scalars(task.body, decls, strings)
+    _collect_scalars(task.body, decls, strings, known)
 
     name = task.name
     lines = [
@@ -1973,7 +2281,11 @@ def _task_c(task: Task, chunks: int) -> list[str]:
         "    double task_started = ae_now_ms();",
     ]
     for scalar, ctype in decls.items():
-        initializer = '""' if ctype.startswith("const char") else ("0.0" if ctype == "double" else "0")
+        initializer = (
+            '""' if ctype.startswith("const char")
+            else "{0}" if ctype == "Tensor"
+            else ("0.0" if ctype == "double" else "0")
+        )
         lines.append(f"    {ctype} {scalar} = {initializer};")
     for stmt in task.body:
         lines.extend(_stmt_c(stmt, known, chunks, depth=0, strings=strings))
@@ -2011,7 +2323,7 @@ def _stmt_c(
         return lines or [pad + "    ;"]
 
     if stmt.kind == "assign":
-        value = _expr_c(stmt.expr, known, chunks)
+        value = _expr_c(stmt.expr, known, chunks, strings)
         kind, _detail = known.get(stmt.name or "", ("value", ""))
         c_type = {
             "tensor": "Tensor",
@@ -2022,17 +2334,17 @@ def _stmt_c(
         return [f"{pad}{c_type} {stmt.name} = {value};"]
 
     if stmt.kind == "let":
-        return [f"{pad}{stmt.name} = {_expr_c(stmt.expr, known, chunks)};"]
+        return [f"{pad}{stmt.name} = {_expr_c(stmt.expr, known, chunks, strings)};"]
 
     if stmt.kind == "repeat":
-        count = _expr_c(stmt.count, known, chunks)
+        count = _expr_c(stmt.count, known, chunks, strings)
         lines = [f"{pad}for (long long ae_i{depth} = 0; ae_i{depth} < (long long)({count}); ae_i{depth}++) {{"]
         lines.extend(render_inner(stmt.body))
         lines.append(f"{pad}}}")
         return lines
 
     if stmt.kind == "while":
-        condition = _expr_c(stmt.expr, known, chunks)
+        condition = _expr_c(stmt.expr, known, chunks, strings)
         max_iters = int(stmt.max_iters or 100_000)
         _GUARD_ID[0] += 1
         guard = f"ae_g{_GUARD_ID[0]}"
@@ -2051,7 +2363,7 @@ def _stmt_c(
         ]
 
     if stmt.kind == "if":
-        condition = _expr_c(stmt.expr, known, chunks)
+        condition = _expr_c(stmt.expr, known, chunks, strings)
         lines = [f"{pad}if ({condition}) {{"]
         lines.extend(render_inner(stmt.body))
         lines.append(f"{pad}}} else {{")
@@ -2066,7 +2378,7 @@ def _stmt_c(
         if isinstance(expr, Name) and expr.id in strings:
             return [f'{pad}ae_log_text((const char *)({expr.id} ? {expr.id} : ""));']
         return [
-            f"{pad}{{ char ae_buf{depth}[256]; snprintf(ae_buf{depth}, sizeof(ae_buf{depth}), \"%.6g\", (double)({_expr_c(expr, known, chunks)})); ae_log_text(ae_buf{depth}); }}"
+            f"{pad}{{ char ae_buf{depth}[256]; snprintf(ae_buf{depth}, sizeof(ae_buf{depth}), \"%.6g\", (double)({_expr_c(expr, known, chunks, strings)})); ae_log_text(ae_buf{depth}); }}"
         ]
 
     if stmt.kind == "emit":
@@ -2087,7 +2399,7 @@ def _stmt_c(
         return [f"{pad}(void)0;"]
 
     if stmt.kind == "return":
-        return [f"{pad}return {_expr_c(stmt.expr, known, chunks)};"]
+        return [f"{pad}return {_expr_c(stmt.expr, known, chunks, strings)};"]
 
     if stmt.kind == "export":
         path = _c_string((stmt.path or "").replace("\\", "/"))
@@ -2104,7 +2416,7 @@ def _stmt_c(
         return [f'{pad}ae_http_serve(&{stmt.target}, {stmt.port or 8080}, "{_c_string(route)}");']
 
     if stmt.kind == "expr" and isinstance(stmt.expr, Call):
-        return [f"{pad}{_expr_c(stmt.expr, known, chunks)};"]
+        return [f"{pad}{_expr_c(stmt.expr, known, chunks, strings)};"]
 
     return [f"{pad}(void)0;"]
 
@@ -2124,7 +2436,11 @@ def _fn_c(function: Function) -> list[str]:
 
     lines = [f"static {ret} ae_fn_{function.name}({params}) {{"]
     for scalar, ctype in decls.items():
-        initializer = '""' if ctype.startswith("const char") else ("0.0" if ctype == "double" else "0")
+        initializer = (
+            '""' if ctype.startswith("const char")
+            else "{0}" if ctype == "Tensor"
+            else ("0.0" if ctype == "double" else "0")
+        )
         lines.append(f"    {ctype} {scalar} = {initializer};")
     for stmt in function.body:
         lines.extend(_stmt_c(stmt, {}, chunks=8, depth=0, strings=strings))
@@ -2143,6 +2459,8 @@ def generate_c(
     _WIDTHS.clear()
     _FNS.clear()
     _FNS.update(fn.name for fn in program.functions)
+    _FN_RETS.clear()
+    _FN_RETS.update({fn.name: fn.ret_type for fn in program.functions})
     _MEMORY_FILE_C = _c_string(Path(source_name).stem + ".memory.json")
     source = _json_string(source_name.replace("\\", "/"))
     header = PREAMBLE.replace("__SOURCE__", source)
@@ -2396,103 +2714,55 @@ def parse_events(stderr: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------- CUDA
-CUDA_TEMPLATE = r"""/*
- * Aether 0.5 -- generated CUDA execution plan. DO NOT EDIT.
- * source: __SOURCE__
- * plan:   f32 | CUDA kernels | one thread per output element
- */
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
 
-__global__ void ae_gemm_bias_relu(const float *x, const float *w, const float *b,
-                                  float *h, int rows, int in_dim, int out_dim) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows || col >= out_dim) return;
-    float acc = b[col];
-    for (int k = 0; k < in_dim; k++) {
-        acc += x[(size_t)row * in_dim + k] * w[(size_t)k * out_dim + col];
+
+
+def _cuda_plan(program: Program) -> dict:
+    """Extract the training workload for the CUDA template (defaults if absent)."""
+    plan = {
+        "task": "Agent",
+        "in_dim": 16,
+        "hidden": 64,
+        "out_dim": 4,
+        "epochs": 5,
+        "samples": 4096,
+        "classes": 4,
     }
-    h[(size_t)row * out_dim + col] = acc > 0.0f ? acc : 0.0f;
-}
-
-__global__ void ae_gemm_bias(const float *h, const float *w, const float *b,
-                             float *y, int rows, int in_dim, int out_dim) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= rows || col >= out_dim) return;
-    float acc = b[col];
-    for (int k = 0; k < in_dim; k++) {
-        acc += h[(size_t)row * in_dim + k] * w[(size_t)k * out_dim + col];
-    }
-    y[(size_t)row * out_dim + col] = acc;
-}
-
-static void ae_cuda_check(cudaError_t err, const char *what) {
-    if (err != cudaSuccess) {
-        fprintf(stderr, "aether: %s failed: %s\n", what, cudaGetErrorString(err));
-        exit(3);
-    }
-}
-
-/* Layered forward pass for one pre-trained AEB1 model (inference demo). */
-static void ae_cuda_forward(const float *x, const float *w1, const float *b1,
-                            const float *w2, const float *b2, float *y,
-                            int rows, int in_dim, int hidden, int out_dim) {
-    float *d_x, *d_w1, *d_b1, *d_h, *d_w2, *d_b2, *d_y;
-    size_t xs = (size_t)rows * in_dim * 4, w1s = (size_t)in_dim * hidden * 4;
-    size_t h1s = (size_t)rows * hidden * 4, w2s = (size_t)hidden * out_dim * 4;
-    size_t y1s = (size_t)rows * out_dim * 4;
-    ae_cuda_check(cudaMalloc(&d_x, xs), "cudaMalloc x");
-    ae_cuda_check(cudaMalloc(&d_w1, w1s), "cudaMalloc w1");
-    ae_cuda_check(cudaMalloc(&d_b1, (size_t)hidden * 4), "cudaMalloc b1");
-    ae_cuda_check(cudaMalloc(&d_h, h1s), "cudaMalloc h");
-    ae_cuda_check(cudaMalloc(&d_w2, w2s), "cudaMalloc w2");
-    ae_cuda_check(cudaMalloc(&d_b2, (size_t)out_dim * 4), "cudaMalloc b2");
-    ae_cuda_check(cudaMalloc(&d_y, y1s), "cudaMalloc y");
-
-    ae_cuda_check(cudaMemcpy(d_x, x, xs, cudaMemcpyHostToDevice), "copy x");
-    ae_cuda_check(cudaMemcpy(d_w1, w1, w1s, cudaMemcpyHostToDevice), "copy w1");
-    ae_cuda_check(cudaMemcpy(d_b1, b1, (size_t)hidden * 4, cudaMemcpyHostToDevice), "copy b1");
-    ae_cuda_check(cudaMemcpy(d_w2, w2, w2s, cudaMemcpyHostToDevice), "copy w2");
-    ae_cuda_check(cudaMemcpy(d_b2, b2, (size_t)out_dim * 4, cudaMemcpyHostToDevice), "copy b2");
-
-    dim3 block(16, 16);
-    dim3 grid1((hidden + 15) / 16, (rows + 15) / 16);
-    ae_gemm_bias_relu<<<grid1, block>>>(d_x, d_w1, d_b1, d_h, rows, in_dim, hidden);
-    dim3 grid2((out_dim + 15) / 16, (rows + 15) / 16);
-    ae_gemm_bias<<<grid2, block>>>(d_h, d_w2, d_b2, d_y, rows, hidden, out_dim);
-    ae_cuda_check(cudaGetLastError(), "kernel launch");
-    ae_cuda_check(cudaDeviceSynchronize(), "sync");
-    ae_cuda_check(cudaMemcpy(y, d_y, y1s, cudaMemcpyDeviceToHost), "copy y");
-
-    cudaFree(d_x); cudaFree(d_w1); cudaFree(d_b1); cudaFree(d_h);
-    cudaFree(d_w2); cudaFree(d_b2); cudaFree(d_y);
-}
-
-int main(void) {
-    int device = 0;
-    cudaDeviceProp prop;
-    cudaError_t err = cudaGetDeviceProperties(&prop, device);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "aether: no CUDA device: %s\n", cudaGetErrorString(err));
-        return 3;
-    }
-    printf("  [device] auto_hardware -> cuda/%s | SM %d.%d | %d SMs | %.1f GB\n",
-           prop.name, prop.major, prop.minor, prop.multiProcessorCount,
-           (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
-    fflush(stdout);
-    return 0;
-}
-"""
+    for task in program.tasks:
+        plan["task"] = task.name
+        for stmt in _iter_statements(task.body):
+            if stmt.kind != "assign" or not isinstance(stmt.expr, Call):
+                continue
+            if stmt.expr.name == "classifier":
+                bound = _bind(stmt.expr, ["in", "classes", "hidden"])
+                plan["in_dim"] = _int(bound.get("in"))
+                plan["hidden"] = _int(bound.get("hidden"), 64)
+                plan["out_dim"] = _int(bound.get("classes"))
+                plan["classes"] = _int(bound.get("classes"))
+            elif stmt.expr.name == "load_data":
+                bound = _bind(stmt.expr, ["samples", "features", "classes"])
+                plan["samples"] = _int(bound.get("samples"))
+                plan["classes"] = _int(bound.get("classes"), plan["classes"])
+        for stmt in _iter_statements(task.body):
+            if stmt.kind == "train":
+                plan["epochs"] = stmt.epochs
+    return plan
 
 
 def generate_cuda(program: Program, source_name: str) -> str:
-    """Emit a CUDA execution plan (inference kernels + device telemetry)."""
+    """Emit a CUDA execution plan: forward/backward SGD training kernels."""
     source = _json_string(source_name.replace("\\", "/"))
-    return CUDA_TEMPLATE.replace("__SOURCE__", source)
+    plan = _cuda_plan(program)
+    return (
+        CUDA_TEMPLATE.replace("__SOURCE__", source)
+        .replace("__TASK__", plan["task"])
+        .replace("__IN__", str(plan["in_dim"]))
+        .replace("__HIDDEN__", str(plan["hidden"]))
+        .replace("__OUT_DIM__", str(plan["out_dim"]))
+        .replace("__EPOCHS__", str(plan["epochs"]))
+        .replace("__SAMPLES__", str(plan["samples"]))
+        .replace("__CLASSES__", str(plan["classes"]))
+    )
 
 
 def compile_cuda(source: str, out_dir: Path, stem: str) -> tuple[Path, float, str]:

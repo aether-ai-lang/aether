@@ -1,0 +1,23 @@
+use ai.core
+use data.core
+use agent.core
+use llm.core
+
+task LLMAgentWorkflow:
+    dataset = load_csv("data/readings.csv", target: "fault") -> auto_hardware
+    model = classifier(in: 8, classes: 4) -> optimize(speed: max)
+    probe = tensor(16, 16) -> auto_hardware
+    while accuracy < 0.9 max_iters(4):
+        train model on dataset(epochs: 2) -> self_heal
+    let prev = recall("best_acc", default: 0.0)
+    remember("best_acc", accuracy)
+    let brief = "Fault classifier converged at accuracy " + str(accuracy) + " (previous best " + str(prev) + ")"
+    let reply = ask llm(brief) -> model("gpt-4o-mini")
+    log reply
+    log sum(probe)
+    log min(probe)
+    log max(probe)
+    log argmax(probe)
+    log max(probe * 0.5)
+    results = run model(dataset) -> stream_output
+    save_json(results, "llm_report.json")

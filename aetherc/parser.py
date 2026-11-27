@@ -586,6 +586,11 @@ class Parser:
             target = self.expect("IDENT")
             args = self.parse_args()
             return Call("run", str(target.value), args, [], token.line, token.column)
+        if token.kind == "IDENT" and token.value == "ask" and self.peek(1).kind == "IDENT" and self.peek(1).value == "llm":
+            self.advance()  # 'ask'
+            self.advance()  # 'llm'
+            args = self.parse_args()
+            return Call("ask_llm", None, args, [], token.line, token.column)
         if token.kind == "IDENT":
             self.advance()
             if self.at("PUNCT", "("):

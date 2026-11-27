@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from .ast_nodes import Call, Literal
@@ -178,6 +179,11 @@ def _median(values: list[float]) -> float:
 
 def _default_threads() -> int:
     """Prefer physical cores: oversubscribing SMT threads hurts BLAS latency."""
+    return _default_threads_cached()
+
+
+@lru_cache(maxsize=1)
+def _default_threads_cached() -> int:
     try:
         output = subprocess.run(
             ["wmic", "cpu", "get", "NumberOfCores"],

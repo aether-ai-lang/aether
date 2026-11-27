@@ -1125,16 +1125,104 @@ class Runtime:
             value = float(tensor.array.mean(dtype=np.float64))
         elif op == "sum":
             value = float(tensor.array.sum(dtype=np.float64))
+        elif op == "min":
+            value = float(tensor.array.min())
+        elif op == "max":
+            value = float(tensor.array.max())
         else:
             raise ValueError(f"unknown reduction '{op}'")
         self._emit_event("reduce", op=op, value=value, elements=tensor.array.size)
         return value
+
+    def argmax(self, tensor: Tensor) -> int:
+        if not isinstance(tensor, Tensor):
+            raise TypeError("argmax() reduces a tensor")
+        index = int(np.argmax(tensor.array))
+        self._emit_event(
+            "reduce", op="argmax", value=float(index), elements=tensor.array.size
+        )
+        return index
 
     def mean(self, tensor: Tensor) -> float:
         return self.reduce("mean", tensor)
 
     def sum(self, tensor: Tensor) -> float:
         return self.reduce("sum", tensor)
+
+    def min(self, tensor: Tensor) -> float:
+        return self.reduce("min", tensor)
+
+    def max(self, tensor: Tensor) -> float:
+        return self.reduce("max", tensor)
+
+    # ------------------------------------------------------------ llm.core
+    def ask_llm(self, prompt: str, model: str) -> str:
+        import json as _json
+        import urllib.error
+        import urllib.request
+
+        prompt = str(prompt)
+        model = str(model)
+        mock = os.environ.get("AETHER_LLM_MOCK") == "1"
+        url = os.environ.get("AETHER_LLM_URL")
+        api_key = os.environ.get("AETHER_LLM_KEY")
+        auto_mock = not (url and api_key)
+        started = time.perf_counter()
+
+        if mock or auto_mock:
+            reason = "mock" if mock else "auto-mock (set AETHER_LLM_URL + AETHER_LLM_KEY for live calls)"
+            reply = f"[{model} mock] {prompt}"
+            mode = "mock" if mock else "auto-mock"
+        else:
+            reason = url or ""
+            mode = "http"
+            payload = _json.dumps(
+                {"model": model, "messages": [{"role": "user", "content": prompt}]}
+            ).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            if api_key:
+                request.add_header("Authorization", f"Bearer {api_key}")
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    body = _json.loads(response.read())
+                reply = str(body["choices"][0]["message"]["content"])
+            except (urllib.error.URLError, KeyError, IndexError, ValueError) as exc:
+                reply = f"[llm error] {type(exc).__name__}: {exc}"
+                mode = "error"
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        self._emit_event(
+            "ask",
+            model=model,
+            prompt_chars=len(prompt),
+            reply_chars=len(reply),
+            mode=mode,
+            reason=reason,
+            ms=elapsed_ms,
+        )
+        return reply
+
+    def scale_tensor(self, tensor: Tensor, factor: float) -> Tensor:
+        if not isinstance(tensor, Tensor):
+            raise TypeError("tensor scaling requires a tensor")
+        scaled = Tensor(array=(tensor.array * np.float32(factor)).astype(F32))
+        self._emit_event(
+            "scale",
+            factor=float(factor),
+            rows=scaled.shape[0],
+            cols=scaled.shape[1],
+        )
+        return scaled
+
+    def str_of(self, value: object) -> str:
+        if isinstance(value, float):
+            return f"{value:.6g}"
+        return str(value)
 
     # ------------------------------------------------------------------- logs
     def log(self, value: object) -> None:

@@ -6,7 +6,7 @@ import difflib
 import re
 from dataclasses import dataclass
 
-AETHER_VERSION = "0.7"
+AETHER_VERSION = "1.0.0"
 
 
 @dataclass

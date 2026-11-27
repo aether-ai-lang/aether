@@ -165,6 +165,19 @@ def _expr_src(call: object, task_policy: dict | None) -> str:
                     max_steps = value.value
                     break
         return f"rt.plan({_expr_src(bound.get('goal'), task_policy)}, {max_steps})"
+    if call.name == "read_file":
+        bound = _bind(call, ["path"])
+        return f"rt.read_file({_value_src(bound.get('path'))})"
+    if call.name == "write_file":
+        bound = _bind(call, ["path", "content"])
+        return (
+            f"rt.write_file({_value_src(bound.get('path'))}, "
+            f"{_expr_src(bound.get('content'), task_policy)})"
+        )
+    if call.name == "load_json":
+        bound = _bind(call, ["path", "key"])
+        key = _value_src(bound.get("key")) if "key" in bound else "None"
+        return f"rt.load_json({_value_src(bound.get('path'))}, {key})"
     if call.name == "load_model":
         bound = _bind(call, ["path"])
         return f"rt.load_model({_value_src(bound.get('path'))})"

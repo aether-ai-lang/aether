@@ -222,7 +222,8 @@ static void ae_send_all(ae_socket_t fd, const char *buf, size_t len) {
 #endif
 }
 
-#define AE_VERSION "0.7"
+#define AE_VERSION "1.0.0"
+#define AE_MAX_BODY (1024 * 1024)  /* 1 MiB request-body hard limit */
 #define AE_SOURCE "__SOURCE__"
 
 static int ae_events = 0;
@@ -1434,6 +1435,182 @@ static char *ae_json_string_field(const char *body, const char *key) {
     return NULL;
 }
 
+/* HTTPS via runtime-loaded transports: WinHTTP (Windows, Schannel TLS) and
+ * libcurl (POSIX). Zero compile-time dependencies; honest errors otherwise. */
+#ifdef _WIN32
+typedef HMODULE ae_dl_t;
+typedef FARPROC ae_sym_t;
+static ae_dl_t ae_sys_dlopen(const char *path) { return LoadLibraryA(path); }
+static ae_sym_t ae_sys_dlsym(ae_dl_t handle, const char *name) { return GetProcAddress(handle, name); }
+#else
+typedef void *ae_dl_t;
+typedef void *ae_sym_t;
+static ae_dl_t ae_sys_dlopen(const char *path) { return dlopen(path, RTLD_NOW | RTLD_LOCAL); }
+static ae_sym_t ae_sys_dlsym(ae_dl_t handle, const char *name) { return dlsym(handle, name); }
+#endif
+
+#ifdef _WIN32
+typedef void *ae_winhttp_t;
+typedef ae_winhttp_t (*pfn_aeWinhttpOpen)(const char *, const char *, const char *, const char *, unsigned int);
+typedef ae_winhttp_t (*pfn_aeWinhttpConnect)(ae_winhttp_t, const char *, unsigned short, unsigned int);
+typedef ae_winhttp_t (*pfn_aeWinhttpOpenRequest)(ae_winhttp_t, const char *, const char *, const char *, const char *, const char *, unsigned int);
+typedef int (*pfn_aeWinhttpSendRequest)(ae_winhttp_t, const char *, unsigned int, void *, unsigned int, unsigned int, void *);
+typedef int (*pfn_aeWinhttpReceiveResponse)(ae_winhttp_t, void *);
+typedef int (*pfn_aeWinhttpReadData)(ae_winhttp_t, void *, unsigned int, unsigned int *);
+typedef int (*pfn_aeWinhttpCloseHandle)(ae_winhttp_t);
+static pfn_aeWinhttpOpen aeWinhttpOpen;
+static pfn_aeWinhttpConnect aeWinhttpConnect;
+static pfn_aeWinhttpOpenRequest aeWinhttpOpenRequest;
+static pfn_aeWinhttpSendRequest aeWinhttpSendRequest;
+static pfn_aeWinhttpReceiveResponse aeWinhttpReceiveResponse;
+static pfn_aeWinhttpReadData aeWinhttpReadData;
+static pfn_aeWinhttpCloseHandle aeWinhttpCloseHandle;
+
+static int ae_winhttp_load(void) {
+    static ae_dl_t lib = NULL;
+    if (lib) return aeWinhttpOpen ? 0 : -1;
+    lib = ae_sys_dlopen("winhttp.dll");
+    if (!lib) return -1;
+#define AE_WINHTTP_SYM(var, name) \
+    var = (pfn_##var)ae_sys_dlsym(lib, name); \
+    if (!var) return -2
+    AE_WINHTTP_SYM(aeWinhttpOpen, "WinHTTPOpen");
+    AE_WINHTTP_SYM(aeWinhttpConnect, "WinHTTPConnect");
+    AE_WINHTTP_SYM(aeWinhttpOpenRequest, "WinHTTPOpenRequest");
+    AE_WINHTTP_SYM(aeWinhttpSendRequest, "WinHTTPSendRequest");
+    AE_WINHTTP_SYM(aeWinhttpReceiveResponse, "WinHTTPReceiveResponse");
+    AE_WINHTTP_SYM(aeWinhttpReadData, "WinHTTPReadData");
+    AE_WINHTTP_SYM(aeWinhttpCloseHandle, "WinHTTPCloseHandle");
+#undef AE_WINHTTP_SYM
+    return 0;
+}
+
+/* POSTs body to an https:// URL via WinHTTP (Schannel TLS). Returns a heap
+ * response body or NULL. */
+static char *ae_https_post_winhttp(const char *url, const char *body, const char *bearer) {
+    if (ae_winhttp_load() != 0) return NULL;
+    /* url: https://host[:port]/path */
+    const char *rest = url + 8;
+    const char *slash = strchr(rest, '/');
+    char host[256] = {0};
+    unsigned short port = 443;
+    const char *path = "/";
+    if (slash) {
+        size_t span = (size_t)(slash - rest);
+        if (span >= sizeof(host)) span = sizeof(host) - 1;
+        memcpy(host, rest, span);
+        path = slash;
+    } else {
+        snprintf(host, sizeof(host), "%s", rest);
+    }
+    char *colon = strchr(host, ':');
+    if (colon) { *colon = 0; port = (unsigned short)atoi(colon + 1); }
+
+    ae_winhttp_t session = aeWinhttpOpen("Aether/1.0", NULL, NULL, NULL, 0);
+    if (!session) return NULL;
+    ae_winhttp_t connection = aeWinhttpConnect(session, host, port, 0);
+    if (!connection) { aeWinhttpCloseHandle(session); return NULL; }
+    ae_winhttp_t request = aeWinhttpOpenRequest(connection, "POST", path, NULL, NULL, NULL,
+                                                0x00800000u /* WINHTTP_FLAG_SECURE */);
+    if (!request) { aeWinhttpCloseHandle(connection); aeWinhttpCloseHandle(session); return NULL; }
+
+    char headers[512];
+    snprintf(headers, sizeof(headers), "Content-Type: application/json\r\nAuthorization: Bearer %s\r\n", bearer);
+    size_t body_len = strlen(body);
+    int sent = aeWinhttpSendRequest(request, headers, (unsigned int)strlen(headers),
+                                    (void *)body, (unsigned int)body_len,
+                                    (unsigned int)body_len, NULL);
+    char *result = NULL;
+    if (sent && aeWinhttpReceiveResponse(request, NULL)) {
+        size_t cap = 262144, got = 0;
+        result = (char *)ae_alloc(cap);
+        unsigned int read = 0;
+        for (;;) {
+            if (got + 1 >= cap) break;
+            if (!aeWinhttpReadData(request, result + got, (unsigned int)(cap - 1 - got), &read) || read == 0) break;
+            got += read;
+            result[got] = 0;
+        }
+    }
+    aeWinhttpCloseHandle(request);
+    aeWinhttpCloseHandle(connection);
+    aeWinhttpCloseHandle(session);
+    return result;
+}
+#endif
+
+#ifndef _WIN32
+typedef void *ae_curl_t;
+typedef ae_curl_t (*pfn_curl_easy_init)(void);
+typedef int (*pfn_curl_easy_setopt_impl)(ae_curl_t, int, ...);
+typedef int (*pfn_curl_easy_perform_impl)(ae_curl_t);
+typedef void (*pfn_curl_easy_cleanup)(ae_curl_t);
+typedef void *(*pfn_curl_slist_append)(void *, const char *);
+typedef void (*pfn_curl_slist_free_all)(void *);
+static ae_curl_t curlEasyInit;
+static pfn_curl_easy_setopt_impl curlEasySetopt;
+static pfn_curl_easy_perform_impl curlEasyPerform;
+static pfn_curl_easy_cleanup curlEasyCleanup;
+static pfn_curl_slist_append curlSlistAppend;
+static pfn_curl_slist_free_all curlSlistFreeAll;
+
+static size_t ae_curl_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t total = size * nmemb;
+    char **out = (char **)userdata;
+    static char *buffer = NULL;
+    static size_t used = 0, cap = 0;
+    (void)out;
+    if (!buffer) { cap = 262144; buffer = (char *)ae_alloc(cap); used = 0; buffer[0] = 0; }
+    if (used + total + 1 >= cap) { cap = (used + total) * 2 + 8; buffer = (char *)realloc(buffer, cap); }
+    memcpy(buffer + used, ptr, total);
+    used += total;
+    buffer[used] = 0;
+    return total;
+}
+
+static void ae_curl_load(void) {
+    static int loaded = 0;
+    if (loaded) return;
+    loaded = 1;
+    static ae_dl_t lib = NULL;
+    const char *candidates[] = {
+        "libcurl.so.4", "libcurl.so", "/usr/lib/x86_64-linux-gnu/libcurl.so.4", NULL
+    };
+    for (int i = 0; candidates[i] && !lib; i++) lib = ae_dlopen(candidates[i]);
+    if (!lib) return;
+    curlEasyInit = (pfn_curl_easy_init)ae_sys_dlsym(lib, "curl_easy_init");
+    curlEasySetopt = (pfn_curl_easy_setopt_impl)ae_sys_dlsym(lib, "curl_easy_setopt");
+    curlEasyPerform = (pfn_curl_easy_perform_impl)ae_sys_dlsym(lib, "curl_easy_perform");
+    curlEasyCleanup = (pfn_curl_easy_cleanup)ae_sys_dlsym(lib, "curl_easy_cleanup");
+    curlSlistAppend = (pfn_curl_slist_append)ae_sys_dlsym(lib, "curl_slist_append");
+    curlSlistFreeAll = (pfn_curl_slist_free_all)ae_sys_dlsym(lib, "curl_slist_free_all");
+}
+
+/* POSTs body to an https:// URL via libcurl. Returns heap body or NULL. */
+static char *ae_https_post_curl(const char *url, const char *body, const char *bearer) {
+    ae_curl_load();
+    if (!curlEasyInit || !curlEasySetopt || !curlEasyPerform) return NULL;
+    ae_curl_t handle = curlEasyInit();
+    if (!handle) return NULL;
+    static char *response = NULL;
+    response = NULL;
+    int opt_url = 10002, opt_post = 10015, opt_write = 20011, opt_follow = 52, opt_headers = 10023;
+    curlEasySetopt(handle, opt_url, url);
+    curlEasySetopt(handle, opt_post, body);
+    curlEasySetopt(handle, opt_write, (void *)&ae_curl_write_cb);
+    curlEasySetopt(handle, opt_follow, 1L);
+    void *header_list = curlSlistAppend(NULL, "Content-Type: application/json");
+    char auth_header[512];
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", bearer);
+    header_list = curlSlistAppend(header_list, auth_header);
+    curlEasySetopt(handle, opt_headers, header_list);
+    int rc = curlEasyPerform();
+    curlSlistFreeAll(header_list);
+    curlEasyCleanup(handle);
+    return rc == 0 ? ae_str_dup(response ? response : "") : NULL;
+}
+#endif
+
 static char *ae_llm_ask(const char *prompt, const char *model) {
     const char *mock_env = getenv("AETHER_LLM_MOCK");
     const char *url_env = getenv("AETHER_LLM_URL");
@@ -1448,9 +1625,40 @@ static char *ae_llm_ask(const char *prompt, const char *model) {
         reply = (char *)ae_alloc(cap);
         snprintf(reply, cap, "[%s mock] %s", model, prompt);
         mode = (mock_env && strcmp(mock_env, "1") == 0) ? "mock" : "auto-mock";
+    } else if (strncmp(url_env, "https://", 8) == 0) {
+        char *payload_json = ae_json_escape_heap(prompt);
+        char body[8192];
+        snprintf(body, sizeof(body),
+                 "{\"model\":\"%s\",\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}]}",
+                 model, payload_json);
+        free(payload_json);
+        const char *bearer = key_env ? key_env : "";
+#ifdef _WIN32
+        char *response = ae_https_post_winhttp(url_env, body, bearer);
+        if (response) {
+            char *http_body = strstr(response, "\r\n\r\n");
+            reply = http_body ? ae_json_string_field(http_body + 4, "content") : NULL;
+            if (!reply) {
+                reply = ae_str_dup("[llm error] no completion in HTTPS response");
+                mode = "error";
+            }
+            free(response);
+        } else {
+            reply = ae_str_dup("[llm error] HTTPS request failed (WinHTTP unavailable or network error)");
+            mode = "error";
+        }
+#else
+        ae_curl_load();
+        char *response = ae_https_post_curl(url_env, body, bearer);
+        reply = response ? ae_json_string_field(response, "content") : NULL;
+        if (!reply) {
+            reply = ae_str_dup("[llm error] HTTPS request failed (libcurl not found or network error)");
+            mode = "error";
+        }
+        free(response);
+#endif
     } else if (strncmp(url_env, "http://", 7) != 0) {
-        reply = ae_str_dup("[llm error] native backend speaks http:// URLs only; "
-                           "set AETHER_LLM_MOCK=1 or use a local HTTP server");
+        reply = ae_str_dup("[llm error] unsupported URL scheme; use https:// or http://");
         mode = "error";
     } else {
         const char *rest = url_env + 7;
@@ -1528,6 +1736,102 @@ static char *ae_llm_ask(const char *prompt, const char *model) {
              model, (int)strlen(prompt), reply ? (int)strlen(reply) : 0, mode, ms);
     if (!reply) reply = ae_str_dup("");
     return reply;
+}
+
+/* ---------------------------------------------------------------- sys.core */
+static char *ae_read_file(const char *path) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "rb");
+    if (!handle) {
+        char *message = (char *)ae_alloc(strlen(resolved) + 64);
+        snprintf(message, strlen(resolved) + 64, "[read error] cannot open %s", resolved);
+        return message;
+    }
+    fseek(handle, 0, SEEK_END);
+    long size = ftell(handle);
+    fseek(handle, 0, SEEK_SET);
+    if (size < 0) size = 0;
+    char *content = (char *)ae_alloc((size_t)size + 1);
+    size_t got = fread(content, 1, (size_t)size, handle);
+    content[got] = 0;
+    fclose(handle);
+    char *escaped = ae_json_escape_heap(resolved);
+    ae_event("{\"event\":\"read_file\",\"path\":\"%s\",\"chars\":%lld,\"backend\":\"c\"}",
+             escaped, (long long)got);
+    ae_human("  [read]   %s | %lld chars", resolved, (long long)got);
+    free(escaped);
+    return content;
+}
+
+static long long ae_write_file(const char *path, const char *content) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "wb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot write %s\n", resolved);
+        exit(3);
+    }
+    size_t len = strlen(content);
+    fwrite(content, 1, len, handle);
+    fclose(handle);
+    char *escaped = ae_json_escape_heap(resolved);
+    ae_event("{\"event\":\"write_file\",\"path\":\"%s\",\"bytes\":%lld,\"backend\":\"c\"}",
+             escaped, (long long)len);
+    ae_human("  [write]  %s | %lld bytes", resolved, (long long)len);
+    free(escaped);
+    return (long long)len;
+}
+
+/* Numeric lookup in a flat JSON document: with a key, reads "key": <number>;
+ * without, parses the document as a bare number. */
+static double ae_load_json_num(const char *path, const char *key) {
+    char resolved[1200];
+    ae_resolve_path(path, resolved, sizeof(resolved));
+    FILE *handle = fopen(resolved, "rb");
+    if (!handle) {
+        fprintf(stderr, "aether: cannot open %s\n", resolved);
+        exit(3);
+    }
+    static char buffer[65536];
+    size_t got = fread(buffer, 1, sizeof(buffer) - 1, handle);
+    fclose(handle);
+    buffer[got] = 0;
+
+    double value = 0.0;
+    if (key && key[0]) {
+        char pattern[256];
+        snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+        const char *cursor = strstr(buffer, pattern);
+        if (cursor) {
+            cursor += strlen(pattern);
+            while (*cursor == ' ' || *cursor == ':') cursor++;
+            char *end = NULL;
+            value = strtod(cursor, &end);
+            if (end == cursor) {
+                fprintf(stderr, "aether: %s has no numeric field '%s'\n", resolved, key);
+                exit(3);
+            }
+        } else {
+            fprintf(stderr, "aether: %s has no field '%s'\n", resolved, key);
+            exit(3);
+        }
+    } else {
+        char *end = NULL;
+        value = strtod(buffer, &end);
+        if (end == buffer) {
+            fprintf(stderr, "aether: %s is not a bare JSON number\n", resolved);
+            exit(3);
+        }
+    }
+
+    char *escaped_path = ae_json_escape_heap(resolved);
+    char *escaped_key = key ? ae_json_escape_heap(key) : ae_str_dup("");
+    ae_event("{\"event\":\"load_json\",\"path\":\"%s\",\"key\":\"%s\",\"value\":%.17g,\"backend\":\"c\"}",
+             escaped_path, escaped_key, value);
+    ae_human("  [json]   %s%s%s = %.6g", resolved, key ? "['" : "", key ? key : "",
+             key ? "']" : "", value);
+    return value;
 }
 
 /* -------------------------------------------------------------- planning */
@@ -1725,8 +2029,39 @@ static void *ae_conn_trampoline(void *arg) {
 }
 #endif
 
+static int ae_header_value(const char *headers, const char *name, char *out, size_t cap) {
+    size_t name_len = strlen(name);
+    const char *line = headers;
+    while (line && *line) {
+        const char *eol = strstr(line, "\r\n");
+        size_t span = eol ? (size_t)(eol - line) : strlen(line);
+        if (span > name_len && line[name_len] == ':' &&
+            strncasecmpaliases(line, name, name_len) == 0) {
+            const char *value = line + name_len + 1;
+            while (*value == ' ') value++;
+            size_t vlen = (eol ? (size_t)(eol - value) : strlen(value));
+            if (vlen >= cap) vlen = cap - 1;
+            memcpy(out, value, vlen);
+            out[vlen] = 0;
+            return 1;
+        }
+        line = eol ? eol + 2 : NULL;
+    }
+    return 0;
+}
+
+static int ae_authorized(const char *headers) {
+    const char *expected = getenv("AETHER_API_KEY");
+    if (!expected || !expected[0]) return 1;  /* auth disabled by default */
+    char presented[512] = "";
+    if (!ae_header_value(headers, "Authorization", presented, sizeof(presented))) return 0;
+    const char *prefix = "Bearer ";
+    if (strncmp(presented, prefix, strlen(prefix)) != 0) return 0;
+    return strcmp(presented + strlen(prefix), expected) == 0 ? 1 : 0;
+}
+
 static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route) {
-    const size_t cap = 262144;
+    const size_t cap = AE_MAX_BODY + 65536;  /* hard 1 MiB body + header headroom */
     char *buf = (char *)malloc(cap);
     if (!buf) {
         AE_CLOSE_SOCKET(fd);
@@ -1743,6 +2078,7 @@ static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route
         if (sep) {
             int content_length = ae_header_int(buf, "Content-Length");
             size_t head = (size_t)(sep + 4 - buf);
+            if (content_length > AE_MAX_BODY) break;  /* rejected below */
             if (content_length <= 0 || got >= head + (size_t)content_length) break;
         }
     }
@@ -1757,6 +2093,28 @@ static void ae_handle_connection(ae_socket_t fd, Model *model, const char *route
     sscanf(buf, "%15s %1023s", method, path);
     char *query = strchr(path, '?');
     if (query) *query = 0;
+
+    if (!ae_authorized(buf)) {
+        ae_http_respond(fd, 401, "{\"error\":\"unauthorized: set the Authorization: Bearer header\"}");
+        ae_event("{\"event\":\"request\",\"method\":\"%s\",\"path\":\"%s\",\"status\":401,\"backend\":\"c\"}",
+                 method, path);
+        free(buf);
+        AE_CLOSE_SOCKET(fd);
+        return;
+    }
+    {
+        char *body_start = strstr(buf, "\r\n\r\n");
+        int content_length = ae_header_int(buf, "Content-Length");
+        if (content_length > AE_MAX_BODY) {
+            ae_http_respond(fd, 413, "{\"error\":\"request body exceeds the 1 MiB limit\"}");
+            ae_event("{\"event\":\"request\",\"method\":\"%s\",\"path\":\"%s\",\"status\":413,\"backend\":\"c\"}",
+                     method, path);
+            free(buf);
+            AE_CLOSE_SOCKET(fd);
+            return;
+        }
+        (void)body_start;
+    }
     double request_started = ae_now_ms();
 
     if (strcmp(method, "GET") == 0 &&
@@ -2045,7 +2403,7 @@ def _is_str_expr(node: object, known: dict[str, tuple[str, str]], strings: set[s
     if isinstance(node, Name):
         return node.id in strings
     if isinstance(node, Call):
-        if node.name in ("ask_llm", "str", "plan"):
+        if node.name in ("ask_llm", "str", "plan", "read_file"):
             return True
         return node.name in _FN_RETS and _FN_RETS[node.name] == "str"
     if isinstance(node, Binary) and node.op == "+":
@@ -2259,6 +2617,46 @@ def _expr_c(
                     break
         goal = _expr_c(bound.get("goal"), known, chunks, strings)
         return f"ae_plan({goal}, {max_steps})"
+    if node.name == "read_file":
+        bound = _bind(node, ["path"])
+        path_node = bound.get("path")
+        text = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "input.txt"
+        )
+        return f'ae_read_file("{_c_string(text)}")'
+    if node.name == "write_file":
+        bound = _bind(node, ["path", "content"])
+        path_node = bound.get("path")
+        text = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "out.txt"
+        )
+        content_node = bound.get("content")
+        if isinstance(content_node, Literal) and isinstance(content_node.value, str):
+            content = f'"{_c_string(content_node.value)}"'
+        elif isinstance(content_node, Name) and content_node.id in strings:
+            content = content_node.id
+        else:
+            content = f"ae_str_of((double)({_expr_c(content_node, known, chunks, strings)}))"
+        return f'ae_write_file("{_c_string(text)}", {content})'
+    if node.name == "load_json":
+        bound = _bind(node, ["path", "key"])
+        path_node = bound.get("path")
+        key_node = bound.get("key")
+        text = (
+            path_node.value
+            if isinstance(path_node, Literal) and isinstance(path_node.value, str)
+            else "data.json"
+        )
+        key = (
+            f'"{_c_string(key_node.value)}"'
+            if isinstance(key_node, Literal) and isinstance(key_node.value, str)
+            else "NULL"
+        )
+        return f'ae_load_json_num("{_c_string(text)}", {key})'
     if node.name in _FNS:
         args = [_expr_c(arg.value, known, chunks, strings) for arg in node.args]
         return f"ae_fn_{node.name}({', '.join(args)})"

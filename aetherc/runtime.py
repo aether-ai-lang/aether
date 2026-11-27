@@ -1286,6 +1286,57 @@ class Runtime:
         )
         return reply
 
+    # --------------------------------------------------------------- sys.core
+    def read_file(self, path: str) -> str:
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        try:
+            content = target.read_text(encoding="utf-8-sig")
+        except OSError as exc:
+            raise ValueError(f"cannot read {target}: {exc}") from exc
+        self._emit_event("read_file", path=str(target), chars=len(content))
+        return content
+
+    def write_file(self, path: str, content: object) -> int:
+        if isinstance(content, float):
+            text = f"{content:.6g}"
+        else:
+            text = str(content)
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8", newline="\n")
+        size = target.stat().st_size
+        self._emit_event("write_file", path=str(target), bytes=size)
+        return size
+
+    def load_json(self, path: str, key: str | None = None) -> float:
+        import json as _json
+
+        target = Path(path)
+        if not target.is_absolute():
+            target = self.base_dir / target
+        try:
+            document = _json.loads(target.read_text(encoding="utf-8-sig"))
+        except OSError as exc:
+            raise ValueError(f"cannot read {target}: {exc}") from exc
+        except ValueError as exc:
+            raise ValueError(f"{target} is not valid JSON: {exc}") from exc
+
+        if key:
+            if not isinstance(document, dict) or key not in document:
+                raise ValueError(f"{target} has no numeric field '{key}'")
+            value = document[key]
+        else:
+            value = document
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{target}: '{key or 'document'}' is not numeric")
+        result = float(value)
+        self._emit_event("load_json", path=str(target), key=key or "", value=result)
+        return result
+
     # ------------------------------------------------------------------- logs
     def log(self, value: object) -> None:
         if isinstance(value, float):

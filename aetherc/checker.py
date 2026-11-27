@@ -17,7 +17,7 @@ from .diagnostics import (
 )
 from pathlib import Path
 
-ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core", "llm.core"}
+ALLOWED_MODULES = {"ai.core", "web.core", "agent.core", "data.core", "llm.core", "sys.core"}
 KNOWN_INTENTS = (
     "tensor",
     "load_data",
@@ -27,6 +27,7 @@ KNOWN_INTENTS = (
     "classifier",
     "run",
     "save_json",
+    "load_json",
     "remember",
     "recall",
     "mean",
@@ -37,6 +38,8 @@ KNOWN_INTENTS = (
     "str",
     "ask_llm",
     "plan",
+    "read_file",
+    "write_file",
 )
 SPEED_VALUES = ("max", "balanced", "low")
 MAX_DIM = 16384
@@ -66,6 +69,9 @@ SIGNATURES = {
     "str": "str(value)",
     "ask_llm": 'ask llm("prompt") -> model("name")',
     "plan": 'plan("goal") -> max_steps(3)',
+    "read_file": 'read_file("path.txt")',
+    "write_file": 'write_file("out.txt", content)',
+    "load_json": 'load_json("data.json", key: "accuracy")',
 }
 
 
@@ -103,11 +109,13 @@ class Checker:
         self.agent_avail = "agent.core" in self.uses
         self.data_avail = "data.core" in self.uses
         self.llm_avail = "llm.core" in self.uses
+        self.sys_avail = "sys.core" in self.uses
         self.reported_missing_core = False
         self.reported_missing_web = False
         self.reported_missing_agent = False
         self.reported_missing_data = False
         self.reported_missing_llm = False
+        self.reported_missing_sys = False
         self.functions: dict[str, Function] = {f.name: f for f in program.functions}
 
     # ------------------------------------------------------------------ utils
@@ -613,6 +621,26 @@ class Checker:
             patch=insert_line_patch(self.path, self.lines, insert_at, "use llm.core"),
         )
 
+    def require_sys_core(self, call: Call) -> None:
+        if self.sys_avail or self.reported_missing_sys:
+            return
+        self.reported_missing_sys = True
+
+        if self.program.uses:
+            insert_at = max(u.line for u in self.program.uses) + 1
+        elif self.program.tasks:
+            insert_at = self.program.tasks[0].line
+        else:
+            insert_at = 1
+        self.error(
+            "AE0200",
+            "Missing 'use sys.core' for system intents",
+            call.line,
+            call.column,
+            hint="Add 'use sys.core' above the first task to use read_file / write_file.",
+            patch=insert_line_patch(self.path, self.lines, insert_at, "use sys.core"),
+        )
+
     def check_call(self, call: Call, scope: dict[str, Ty], default_policy: dict | None) -> Ty:
         if call.name in self.functions:
             return self.check_fn_call(call, scope)
@@ -663,6 +691,10 @@ class Checker:
             return self.check_ask_llm(call, scope)
         if call.name == "plan":
             return self.check_plan(call, scope)
+        if call.name in ("read_file", "write_file"):
+            return self.check_file_io(call, scope)
+        if call.name == "load_json":
+            return self.check_load_json(call, scope)
         return self.check_run(call, scope)
 
     # ------------------------------------------------------------ intent: tensor
@@ -1233,6 +1265,71 @@ class Checker:
             )
         return Ty("str")
 
+    # -------------------------------------------------------- sys.core file I/O
+    def check_file_io(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_sys_core(call)
+        bound, _ = self.bind(
+            call, [("path", True), ("content", True)] if call.name == "write_file" else [("path", True)]
+        )
+
+        path = bound.get("path")
+        if not isinstance(path, Literal) or not isinstance(path.value, str) or not path.value:
+            self.error(
+                "AE0212",
+                f"{call.name} requires a quoted, non-empty path",
+                getattr(path, "line", call.line),
+                getattr(path, "column", call.column),
+                hint='Example: read_file("notes.txt")',
+            )
+        elif len(path.value) > 240:
+            self.error(
+                "AE0212",
+                f"{call.name} path is too long (max 240 characters)",
+                path.line,
+                path.column,
+            )
+
+        if call.name == "write_file":
+            content = bound.get("content")
+            if content is not None:
+                ty = self.check_expr(content, scope, {})
+                if ty.kind not in ("str", "int", "float", "bool"):
+                    self.error(
+                        "AE0210",
+                        f"cannot write {self.article(ty.kind)} to a file",
+                        getattr(content, "line", call.line),
+                        getattr(content, "column", call.column),
+                        hint="write_file takes strings and numbers.",
+                    )
+            return Ty("int")
+        return Ty("str")
+
+    def check_load_json(self, call: Call, scope: dict[str, Ty]) -> Ty:
+        self.require_data_core(call)
+        bound, _ = self.bind(call, [("path", True), ("key", False)])
+
+        path = bound.get("path")
+        if not isinstance(path, Literal) or not isinstance(path.value, str) or not path.value:
+            self.error(
+                "AE0212",
+                'load_json requires a quoted, non-empty path',
+                getattr(path, "line", call.line),
+                getattr(path, "column", call.column),
+                hint='Example: load_json("report.json", key: "accuracy")',
+            )
+
+        key_node = bound.get("key")
+        if key_node is not None:
+            if not isinstance(key_node, Literal) or not isinstance(key_node.value, str) or not key_node.value:
+                self.error(
+                    "AE0212",
+                    "load_json key must be a quoted field name",
+                    getattr(key_node, "line", call.line),
+                    getattr(key_node, "column", call.column),
+                    hint='Example: load_json("report.json", key: "accuracy")',
+                )
+        return Ty("float")
+
     # ------------------------------------------------------------- fn functions
     def check_fn_call(self, call: Call, scope: dict[str, Ty]) -> Ty:
         function = self.functions[call.name]
@@ -1760,6 +1857,8 @@ class Checker:
             "save_json",
             "ask_llm",
             "plan",
+            "read_file",
+            "load_json",
         )
         if not isinstance(expr, (Literal, Binary, Unary, Name)) and not (is_fn_call or is_scalar_intent):
             self.error(

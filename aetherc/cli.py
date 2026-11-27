@@ -309,6 +309,16 @@ def make_printer(ui: UI):
                 f"  [llm]    {event['model']} | {event['prompt_chars']} chars in | "
                 f"{event['reply_chars']} chars out | {event['mode']} | {event['ms']:.1f} ms"
             )
+        elif kind == "read_file":
+            print(f"  [read]   {Path(event['path']).name} | {event['chars']} chars")
+        elif kind == "write_file":
+            print(f"  [write]  {Path(event['path']).name} | {event['bytes']} bytes")
+        elif kind == "load_json":
+            print(
+                f"  [json]   {Path(event['path']).name}"
+                + (f"['{event['key']}']" if event.get("key") else "")
+                + f" = {event['value']:.6g}"
+            )
         elif kind == "save_json":
             print(
                 f"  [json]   {Path(event['path']).name} | {event['bytes']} bytes"
@@ -1040,8 +1050,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aether",
         description=(
-            "Aether 0.7 - intent-driven AI-agent-native compiler "
-            "(llm.core native client, tensor math, CUDA training kernels)"
+            "Aether 1.0.0 - intent-driven AI-agent-native compiler "
+            "(sys.core, HTTPS LLM client, packages, GPU dispatch, MCP)"
         ),
     )
     parser.add_argument(

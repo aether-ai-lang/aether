@@ -106,16 +106,35 @@ def _slug_from_url(source: str) -> str:
     return slug or "package"
 
 
+_GIT_URL_RE = re.compile(r"^(https://[^\s]+\.git|git@[\w.-]+:[\w./-]+\.git)$")
+# For git sources (the only ones passed to a subprocess): reject anything that
+# could smuggle options or shell metacharacters into the clone invocation.
+_UNSAFE_URL_RE = re.compile(r"[\s;&|<>$`!\"']")
+
+MAX_PACKAGE_FILE_BYTES = 1_000_000
+
+
 def install_package(source: str, project_root: Path) -> tuple[str, str]:
     """Install a package into `<project_root>/.aether_packages/<name>`.
 
-    Returns (package_name, how). Sources: a git URL, a local directory of
-    `.ae` modules, or a local `.ae` file (copied as a single-file package).
+    Returns (package_name, how). Sources: an https/git SSH URL, a local
+    directory of `.ae` modules, or a local `.ae` file (single-file package).
+
+    Security: git clones run with shell=False list arguments, git-URL schemes
+    only (https / git@), a strict character whitelist, and rejection of leading
+    dashes (option injection). Local sources are copied with shutil — never
+    executed.
     """
+    if not source or len(source) > 300:
+        raise ValueError("install source must be a non-empty string under 300 characters")
+    if source.startswith("-"):
+        raise ValueError("install source must not start with '-' (option injection)")
+    if source.startswith("file://"):
+        raise ValueError("file:// URLs are not supported; pass a local path instead")
     packages = project_root / ".aether_packages"
     packages.mkdir(parents=True, exist_ok=True)
 
-    if source.endswith(".git") or source.startswith(("http://", "https://", "git@")):
+    if _GIT_URL_RE.match(source):
         name = _slug_from_url(source)
         target = packages / name
         if target.exists():
@@ -130,6 +149,8 @@ def install_package(source: str, project_root: Path) -> tuple[str, str]:
         return name, "git"
 
     local = Path(source)
+    # Local sources are copied with shutil, never executed; the git-URL
+    # whitelist above is the only path that reaches a subprocess.
     if local.is_dir():
         name = _slug_from_url(source)
         ae_files = list(local.glob("*.ae"))

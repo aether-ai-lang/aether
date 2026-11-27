@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aether (.ae) — The First Programming Language Built for AI Agents</title>
+<meta name="description" content="Aether is an intent-driven, agent-native language that compiles to standalone multi-threaded C99 machine code. Train, serve, remember, plan — 96% fewer tokens than Python.">
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #11151f;
+    --panel2: #151a26;
+    --text: #e6e9f0;
+    --muted: #8b93a7;
+    --accent: #7c5cff;
+    --accent2: #00d4aa;
+    --warn: #ffb454;
+    --border: #232a3a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Inter", "Segoe UI", system-ui, sans-serif;
+    line-height: 1.6;
+  }
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+  header { padding: 72px 0 40px; text-align: center; }
+  header h1 { font-size: clamp(2.2rem, 6vw, 3.6rem); letter-spacing: -0.02em; }
+  header h1 .ae { color: var(--accent); }
+  header p.tag { font-size: clamp(1.05rem, 2.4vw, 1.35rem); color: var(--muted); margin: 14px 0 26px; }
+  .badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-bottom: 30px; }
+  .badge {
+    font-size: 0.78rem; padding: 4px 12px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  }
+  .badge b { color: var(--text); }
+  .cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    padding: 12px 26px; border-radius: 10px; font-weight: 600; font-size: 0.95rem;
+    border: 1px solid var(--border); background: var(--panel); color: var(--text);
+    transition: transform .12s ease, border-color .12s ease;
+  }
+  .btn:hover { transform: translateY(-2px); border-color: var(--accent); text-decoration: none; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  section { padding: 48px 0; }
+  h2 { font-size: 1.6rem; margin-bottom: 22px; letter-spacing: -0.01em; }
+  h2 span { color: var(--accent2); }
+  .grid { display: grid; gap: 18px; }
+  .grid.two { grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .grid.three { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px;
+  }
+  .card h3 { font-size: 1.02rem; margin-bottom: 8px; }
+  .card p { color: var(--muted); font-size: 0.92rem; }
+  pre {
+    background: #0d1117; border: 1px solid var(--border); border-radius: 12px;
+    padding: 18px; overflow-x: auto; font-size: 0.86rem; line-height: 1.55;
+  }
+  code { font-family: "JetBrains Mono", "Cascadia Code", Consolas, monospace; }
+  .k { color: #c678dd; } .s { color: #98c379; } .n { color: #d19a66; } .f { color: #61afef; } .c { color: #5c6370; font-style: italic; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.hl td { background: rgba(124, 92, 255, 0.08); }
+  tr.hl td:first-child { color: var(--accent2); font-weight: 700; }
+  .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 26px 0; }
+  .metric { background: var(--panel2); border: 1px solid var(--border); border-radius: 14px; padding: 20px; text-align: center; }
+  .metric .big { font-size: 2rem; font-weight: 800; color: var(--accent2); }
+  .metric .label { color: var(--muted); font-size: 0.82rem; }
+  .steps { counter-reset: step; }
+  .steps li { list-style: none; margin: 10px 0; padding-left: 44px; position: relative; }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 2px; width: 30px; height: 30px; border-radius: 8px;
+    background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 0.9rem;
+  }
+  code.inline { background: var(--panel2); padding: 2px 7px; border-radius: 6px; font-size: 0.85em; }
+  footer { border-top: 1px solid var(--border); padding: 32px 0; color: var(--muted); font-size: 0.85rem; text-align: center; }
+</style>
+</head>
+<body>
+
+<header class="wrap">
+  <h1>⬡ Aether <span class="ae">(.ae)</span></h1>
+  <p class="tag">The First Programming Language Built for AI Agents, Not Human Typists.</p>
+  <div class="badges">
+    <span class="badge">v<b>1.0.0</b></span>
+    <span class="badge">compiles to <b>C99 + OpenMP</b></span>
+    <span class="badge">CUDA → OpenCL → C99 dispatch</span>
+    <span class="badge">standalone <b>aether.exe</b></span>
+    <span class="badge">MCP server</span>
+  </div>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/aether-ai-lang/aether">★ Star on GitHub</a>
+    <a class="btn" href="#quickstart">Get Started</a>
+    <a class="btn" href="https://github.com/aether-ai-lang/aether/blob/main/AETHER_SPEC.md">Read the Spec</a>
+  </div>
+</header>
+
+<section class="wrap">
+  <div class="metrics">
+    <div class="metric"><div class="big">96%</div><div class="label">fewer AI tokens than hand-written Python</div></div>
+    <div class="metric"><div class="big">1.68×</div><div class="label">faster than hand-written NumPy</div></div>
+    <div class="metric"><div class="big">7 → 168</div><div class="label">lines of .ae vs lines of Python</div></div>
+    <div class="metric"><div class="big">0.09ms</div><div class="label">native C99 inference per request</div></div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Seven lines. <span>A trained, served AI model.</span></h2>
+  <div class="grid two">
+    <pre><code><span class="k">use</span> ai.core
+<span class="k">use</span> data.core
+<span class="k">use</span> agent.core
+<span class="k">use</span> llm.core
+
+<span class="k">task</span> <span class="f">SmartAgent</span>:
+    dataset = <span class="f">load_csv</span>(<span class="s">"data/readings.csv"</span>, target: <span class="s">"fault"</span>) <span class="k">-&gt;</span> auto_hardware
+    model = <span class="f">classifier</span>(in: <span class="n">8</span>, classes: <span class="n">4</span>) <span class="k">-&gt;</span> <span class="f">optimize</span>(speed: max)
+    <span class="k">while</span> accuracy &lt; <span class="n">0.9</span> <span class="f">max_iters</span>(<span class="n">4</span>):
+        <span class="k">train</span> model <span class="k">on</span> dataset(epochs: <span class="n">2</span>) <span class="k">-&gt;</span> self_heal
+    <span class="k">remember</span>(<span class="s">"best_acc"</span>, accuracy)
+    <span class="k">let</span> brief = <span class="s">"Final accuracy: "</span> + <span class="f">str</span>(accuracy)
+    <span class="k">let</span> reply = <span class="k">ask</span> llm(brief) <span class="k">-&gt;</span> <span class="f">model</span>(<span class="s">"gpt-4o-mini"</span>)
+    <span class="f">log</span> reply
+    <span class="k">export</span> model <span class="k">-&gt;</span> <span class="s">"agent.ae.bin"</span></code></pre>
+    <div>
+      <div class="card" style="margin-bottom: 18px;">
+        <h3>You declare. It compiles.</h3>
+        <p>Aether lowers your intent graph to standalone, multi-threaded <b>C99</b> — fused kernels, adaptive BLAS threading, HTTP servers, LLM clients — then invokes gcc/clang/MSVC. The binary that runs is machine code. No interpreter ships with your agent.</p>
+      </div>
+      <div class="card">
+        <h3>Errors are contracts, not crashes.</h3>
+        <p>Every diagnostic carries a stable code, a hint, and a <code class="inline">fix_patch</code> unified diff. Agents apply the patch, re-check, and continue — no human keystrokes. The <code class="inline">aether mcp</code> server exposes check / fix / compile / run / spec / bench to any MCP client.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>The benchmark. <span>Measured, reproducible.</span></h2>
+  <pre><code>$ aether bench examples/train_ai_agent.ae
+<span class="c">  workload  10,000 samples x 128 features | 10 classes | 5 epochs | median of 3</span>
+
+  Implementation                Tokens  Lines      Train      Infer      Total  Speedup  Accuracy
+  aether -&gt; C/OpenMP (native)       62      7    179.8 ms     17.1 ms    233.1 ms    1.68x    0.9050
+  aether -&gt; Python/NumPy            62      7    362.3 ms     14.6 ms    404.8 ms    0.96x    0.9218
+  python/numpy (hand-written)    1,480    168    332.9 ms     14.7 ms    390.6 ms    1.00x    0.9077
+  pytorch (hand-written)           937    107    374.7 ms      9.7 ms    400.9 ms    0.97x    0.9024</code></pre>
+</section>
+
+<section class="wrap" id="quickstart">
+  <h2>Up and running in <span>60 seconds.</span></h2>
+  <ol class="steps">
+    <li><b>Clone the compiler.</b><br><code class="inline">git clone https://github.com/aether-ai-lang/aether.git && cd aether</code></li>
+    <li><b>Build the standalone binary (optional but recommended).</b><br><code class="inline">python build_standalone.py</code> → <code class="inline">dist/aether.exe</code>, zero Python needed afterwards.</li>
+    <li><b>Run your first program.</b><br><code class="inline">aether run hello_aether.ae</code> — compiles to C99 and executes the binary.</li>
+    <li><b>Serve a model over HTTP.</b><br><code class="inline">aether run examples/serve_ai_api.ae</code> — the binary <i>is</i> the server.</li>
+    <li><b>Benchmark it.</b><br><code class="inline">aether bench examples/train_ai_agent.ae</code></li>
+  </ol>
+  <p style="margin-top:14px; color:var(--muted); font-size:0.9rem;">
+    No C compiler? Aether auto-falls back to its bundled Python/NumPy backend — same language, same semantics.
+    GPUs? The dispatch ladder is <b>CUDA → OpenCL → C99 → Python</b>, honestly reported at every rung.
+  </p>
+</section>
+
+<section class="wrap">
+  <h2>Everything an agent needs. <span>One grammar.</span></h2>
+  <div class="grid three">
+    <div class="card"><h3>🧠 ai.core</h3><p>Tensors, MLPs, classifiers, SGD training with self-healing, chunked streaming inference, AEB1 model export.</p></div>
+    <div class="card"><h3>📊 data.core</h3><p>Real CSV ingestion, JSON load/save, all compiled to native C99 file I/O.</p></div>
+    <div class="card"><h3>🌐 web.core</h3><p>Serve any model as a JSON API from the compiled binary. Winsock2/POSIX, thread-per-connection.</p></div>
+    <div class="card"><h3>🤖 agent.core</h3><p>Loops, persistent memory across executions, and LLM-backed multi-step planning.</p></div>
+    <div class="card"><h3>🔌 llm.core</h3><p>OpenAI-compatible chat completions from raw C99 sockets (WinHTTP/libcurl), with deterministic mock mode.</p></div>
+    <div class="card"><h3>⚙️ sys.core</h3><p>File read/write and JSON field loading — the glue agents need, at machine speed.</p></div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Hardware dispatch. <span>Honest at every rung.</span></h2>
+  <div class="grid two">
+    <pre><code>$ aether run examples/train_ai_agent.ae
+<span class="c">  [device] auto_hardware -&gt; cuda/RTX 3060 | SM 86       </span><span class="c">← GPU + nvcc</span>
+<span class="c">  [device] auto_hardware -&gt; opencl | ICD loaded         </span><span class="c">← OpenCL tier</span>
+<span class="c">  [device] auto_hardware -&gt; c/native | 16 threads |     </span><span class="c">← AVX-512 + OpenBLAS</span>
+<span class="c">           OpenBLAS | discrete-gpu tier | f32</span></code></pre>
+    <div class="card">
+      <h3>No fake GPU execution. Ever.</h3>
+      <p>When a tier is unavailable — no nvcc, no registered ICD, no compiler — Aether says so in the telemetry and JSON <code class="inline">note</code> field, then dispatches to the next tier. The same program runs everywhere; the hardware report is always truthful.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap">
+  <h2>Ship it. <span>As a binary.</span></h2>
+  <div class="grid two">
+    <div class="card">
+      <h3>One command.</h3>
+      <p><code class="inline">python build_standalone.py</code> → a 19 MB <code class="inline">aether.exe</code> embedding the compiler, the Python/NumPy backend, and the language spec. Verified with Python <i>removed from PATH</i>.</p>
+    </div>
+    <div class="card">
+      <h3>Agents drive it natively.</h3>
+      <p>The <code class="inline">aether mcp</code> server (JSON-RPC over stdio) plugs into OpenCode, Claude Code, and Cursor: check, self-heal, compile, run, read the spec, benchmark.</p>
+    </div>
+  </div>
+</section>
+
+<footer class="wrap">
+  <p>MIT License · © 2026 Ermiyas — Founder of Aether · <a href="https://github.com/aether-ai-lang/aether">github.com/aether-ai-lang/aether</a></p>
+  <p style="margin-top:6px;">Intent in. Machine code out.</p>
+</footer>
+
+</body>
+</html>

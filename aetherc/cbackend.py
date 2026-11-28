@@ -115,6 +115,15 @@ def find_toolchain(preferred: str | None = None) -> Toolchain | None:
         if resolved:
             return make(str(resolved))
 
+    # On Windows, prefer the bundled, verified toolchain over whatever happens
+    # to be first on PATH (third-party toolchains vary in runtime support).
+    local = os.environ.get("LOCALAPPDATA")
+    if os.name == "nt" and local:
+        for name in ("gcc.exe", "clang.exe"):
+            candidate = Path(local) / "Aether" / "toolchain" / "w64devkit" / "bin" / name
+            if candidate.is_file():
+                return make(str(candidate))
+
     for name in ("gcc", "clang", "cl"):
         resolved = shutil.which(name)
         if resolved:
@@ -258,9 +267,16 @@ static void ae_blas_tune(int m, int k, int n) {
 #endif
 
 static double ae_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+#endif
 }
 
 static void ae_event(const char *fmt, ...) {

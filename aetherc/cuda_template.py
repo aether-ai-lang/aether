@@ -13,6 +13,9 @@ CUDA_TEMPLATE = r"""/*
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #define IN_DIM __IN__
 #define HIDDEN __HIDDEN__
@@ -149,6 +152,19 @@ static void ae_cuda_check(cudaError_t err, const char *what) {
         fprintf(stderr, "aether: %s failed: %s\n", what, cudaGetErrorString(err));
         exit(3);
     }
+}
+
+static double ae_now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1000.0 + (double)t.tv_nsec / 1e6;
+#endif
 }
 
 static uint64_t ae_rng = 0xAE7EULL;
